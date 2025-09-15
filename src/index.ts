@@ -1,6 +1,7 @@
 // src/index.ts
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import { serveStatic } from "hono/cloudflare-workers"; // <== สำคัญสำหรับ static assets
 import { getDb, Env } from "./db";
 import { hashPassword, verifyPassword, genToken } from "./crypto";
 import { z } from "zod";
@@ -251,6 +252,8 @@ app.post("/auth/logout-all", auth, async (c) => {
 		return c.json({ error: "internal", detail: e?.message ?? String(e) }, 500);
 	}
 });
+
+app.use("/images/*", serveStatic({ root: "./" }));
 
 // ✅ Bind fetch handler ชัดเจน (กัน Wrangler บางเวอร์ชันไม่เห็น handler)
 export default {
