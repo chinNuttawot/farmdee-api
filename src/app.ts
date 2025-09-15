@@ -4,6 +4,7 @@ import { serveStatic } from "hono/cloudflare-workers";
 import debugRouter from "./routes/debug";
 import authRouter from "./routes/auth";
 import meRouter from "./routes/me";
+import tasksRouter from "./routes/tasks";
 import type { Bindings } from "./types";
 
 const app = new Hono<{ Bindings: Bindings }>();
@@ -34,6 +35,8 @@ app.use(
 app.route("/", debugRouter);      // /__debug/*, /__db/ping, /health
 app.route("/auth", authRouter);   // /auth/*
 app.route("/me", meRouter);       // /me
+app.route("/tasks", tasksRouter);       // /me
+
 
 // Static assets (เช่น /images/xxx.png)
 app.use("/images/*", serveStatic({ root: "./" }));
