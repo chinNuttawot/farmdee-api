@@ -1,3 +1,4 @@
+// src/routes/tasks.ts
 import { Hono } from "hono";
 import { getDb } from "../db";
 import { auth } from "../middlewares/auth";
@@ -11,101 +12,118 @@ const router = new Hono();
  * user: เห็นเฉพาะงานที่ตัวเองถูก assign
  */
 router.get("/", auth, async (c) => {
-    const db = getDb((c as any).env);
-    const u = c.get("user") as { id: number; role?: string };
+  const db = getDb((c as any).env);
+  const u = c.get("user") as { id: number; role?: string };
 
-    const { from, to, status, jobType } = c.req.query();
+  const q = c.req.query();
+  const fromParam = q.from ?? null;
+  const toParam = q.to ?? null;
+  const statusParam = q.status ?? null;
+  const jobTypeParam = q.jobType ?? null;
 
-    // สร้างเงื่อนไขแบบ fragment (ห้ามใช้ String(...) เด็ดขาด)
-    const where: any[] = [];
-    if (from) where.push(db`t.start_date >= ${from}`);
-    if (to) where.push(db`t.end_date   <= ${to}`);
-    if (status) where.push(db`t.status   = ${status}`);
-    if (jobType) where.push(db`t.job_type = ${jobType}`);
-
-    const visible = isBossOrAdmin(u)
-        ? db`TRUE`
-        : db`EXISTS (
-         SELECT 1
-         FROM task_assignees ta
-         WHERE ta.task_id = t.id AND ta.user_id = ${u.id}
-       )`;
-
-    const rows = await db`
-    SELECT
-      t.*,
-      COALESCE(
-        json_agg(
-          json_build_object('id', u2.id, 'username', u2.username)
-          ORDER BY u2.username
-        ) FILTER (WHERE u2.id IS NOT NULL),
-        '[]'
-      ) AS assignees
-    FROM tasks t
-    LEFT JOIN task_assignees ta ON ta.task_id = t.id
-    LEFT JOIN users u2 ON u2.id = ta.user_id
-    WHERE ${visible}
-      ${where.length ? db`AND ${db.join(where, db` AND `)}` : db``}
-    GROUP BY t.id
-    ORDER BY t.start_date ASC, t.id ASC
-  `;
-
+  if (isBossOrAdmin(u)) {
+    const rows = await db/*sql*/`
+      SELECT
+        t.*,
+        COALESCE((
+          SELECT json_agg(
+                   json_build_object('id', u2.id, 'username', u2.username)
+                   ORDER BY u2.username
+                 )
+          FROM task_assignees ta
+          JOIN users u2 ON u2.id = ta.user_id
+          WHERE ta.task_id = t.id
+        ), '[]'::json) AS assignees
+      FROM tasks t
+      WHERE
+        t.start_date >= COALESCE(${fromParam}, t.start_date)
+        AND t.end_date   <= COALESCE(${toParam},   t.end_date)
+        AND t.status     =  COALESCE(${statusParam},  t.status)
+        AND t.job_type   =  COALESCE(${jobTypeParam}, t.job_type)
+      ORDER BY t.start_date ASC, t.id ASC
+    `;
     return c.json(rows);
+  } else {
+    const rows = await db/*sql*/`
+      SELECT
+        t.*,
+        COALESCE((
+          SELECT json_agg(
+                   json_build_object('id', u2.id, 'username', u2.username)
+                   ORDER BY u2.username
+                 )
+          FROM task_assignees ta
+          JOIN users u2 ON u2.id = ta.user_id
+          WHERE ta.task_id = t.id
+        ), '[]'::json) AS assignees
+      FROM tasks t
+      JOIN task_assignees ta_v
+        ON ta_v.task_id = t.id
+       AND ta_v.user_id = ${u.id}
+      WHERE
+        t.start_date >= COALESCE(${fromParam}, t.start_date)
+        AND t.end_date   <= COALESCE(${toParam},   t.end_date)
+        AND t.status     =  COALESCE(${statusParam},  t.status)
+        AND t.job_type   =  COALESCE(${jobTypeParam}, t.job_type)
+      ORDER BY t.start_date ASC, t.id ASC
+    `;
+    return c.json(rows);
+  }
 });
 
-/** GET /tasks/:id — บังคับสิทธิ์อ่านตามเดียวกับด้านบน */
+/** GET /tasks/:id — สิทธิ์อ่านเหมือน /tasks */
 router.get("/:id", auth, async (c) => {
-    const db = getDb((c as any).env);
-    const u = c.get("user") as { id: number; role?: string };
-    const id = Number(c.req.param("id"));
+  const db = getDb((c as any).env);
+  const u = c.get("user") as { id: number; role?: string };
+  const id = Number(c.req.param("id"));
 
-    const visible = isBossOrAdmin(u)
-        ? db`TRUE`
-        : db`EXISTS (
-         SELECT 1
-         FROM task_assignees ta
-         WHERE ta.task_id = t.id AND ta.user_id = ${u.id}
-       )`;
+  // 1) มี task นี้ไหม
+  const exists = await db`SELECT 1 FROM tasks WHERE id = ${id} LIMIT 1`;
+  if (!exists.length) return c.json({ error: "not_found" }, 404);
 
-    const rows = await db`
+  // 2) มีสิทธิ์เห็นไหม
+  if (!isBossOrAdmin(u)) {
+    const canSee = await db`
+      SELECT 1
+      FROM task_assignees
+      WHERE task_id = ${id} AND user_id = ${u.id}
+      LIMIT 1
+    `;
+    if (!canSee.length) return c.json({ error: "forbidden" }, 403);
+  }
+
+  // 3) ดึงข้อมูล + assignees
+  const rows = await db/*sql*/`
     SELECT
       t.*,
-      COALESCE(
-        json_agg(
-          json_build_object('id', u2.id, 'username', u2.username)
-          ORDER BY u2.username
-        ) FILTER (WHERE u2.id IS NOT NULL),
-        '[]'
-      ) AS assignees
+      COALESCE((
+        SELECT json_agg(
+                 json_build_object('id', u2.id, 'username', u2.username)
+                 ORDER BY u2.username
+               )
+        FROM task_assignees ta
+        JOIN users u2 ON u2.id = ta.user_id
+        WHERE ta.task_id = t.id
+      ), '[]'::json) AS assignees
     FROM tasks t
-    LEFT JOIN task_assignees ta ON ta.task_id = t.id
-    LEFT JOIN users u2 ON u2.id = ta.user_id
-    WHERE t.id = ${id} AND ${visible}
-    GROUP BY t.id
+    WHERE t.id = ${id}
+    LIMIT 1
   `;
-
-    if (!rows.length) return c.json({ error: "not_found" }, 404);
-    return c.json(rows[0]);
+  return c.json(rows[0]);
 });
 
-/** POST /tasks — ให้เฉพาะ boss/admin สร้างงาน */
+/** POST /tasks — boss/admin เท่านั้น */
 router.post("/", auth, requireRole(["boss", "admin"]), async (c) => {
-    const db = getDb((c as any).env);
-    const creator = c.get("user") as { id: number };
+  const db = getDb((c as any).env);
+  const creator = c.get("user") as { id: number };
 
-    let body: unknown;
-    try {
-        body = await c.req.json();
-    } catch {
-        return c.json({ error: "Invalid JSON" }, 400);
-    }
+  let body: unknown;
+  try { body = await c.req.json(); } catch { return c.json({ error: "Invalid JSON" }, 400); }
+  const parsed = CreateTaskSchema.safeParse(body);
+  if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400);
+  const d = parsed.data;
 
-    const parsed = CreateTaskSchema.safeParse(body);
-    if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400);
-
-    const d = parsed.data;
-
-    const trow = await db<{ id: number }>`
+  const trow = await db<{ id: number }>`
     INSERT INTO tasks (
       title, job_type, start_date, end_date, area, trucks,
       total_amount, paid_amount, note, status, color, tags, progress, created_by
@@ -116,150 +134,148 @@ router.post("/", auth, requireRole(["boss", "admin"]), async (c) => {
       ${d.note ?? null}, ${d.status ?? 'รอทำ'},
       ${d.color ?? null}, ${d.tags ?? []},
       0, ${creator.id}
-    )
-    RETURNING id
+    ) RETURNING id
   `;
-    const taskId = trow[0].id;
+  const taskId = trow[0].id;
 
-    // ผูก assignees
-    if (d.assigneeIds?.length) {
-        for (const uid of d.assigneeIds) {
-            await db`
-        INSERT INTO task_assignees (task_id, user_id)
-        VALUES (${taskId}, ${uid})
-        ON CONFLICT DO NOTHING
-      `;
-        }
-    } else if (d.assigneeUsernames?.length) {
-        const urows = await db<{ id: number }>`
-      SELECT id FROM users WHERE username = ANY(${d.assigneeUsernames})
-    `;
-        for (const u2 of urows) {
-            await db`
-        INSERT INTO task_assignees (task_id, user_id)
-        VALUES (${taskId}, ${u2.id})
-        ON CONFLICT DO NOTHING
-      `;
-        }
+  if (d.assigneeIds?.length) {
+    for (const uid of d.assigneeIds) {
+      await db`INSERT INTO task_assignees (task_id, user_id) VALUES (${taskId}, ${uid}) ON CONFLICT DO NOTHING`;
     }
+  } else if (d.assigneeUsernames?.length) {
+    const urows = await db<{ id: number }>`SELECT id FROM users WHERE username = ANY(${d.assigneeUsernames})`;
+    for (const u2 of urows) {
+      await db`INSERT INTO task_assignees (task_id, user_id) VALUES (${taskId}, ${u2.id}) ON CONFLICT DO NOTHING`;
+    }
+  }
 
-    return c.json({ message: "created", id: taskId }, 201);
+  return c.json({ message: "created", id: taskId }, 201);
 });
 
 /** PATCH /tasks/:id
  * boss/admin: แก้ได้ทุกฟิลด์
- * user: จำกัดให้แก้เฉพาะ progress, note
+ * user: ปรับได้เฉพาะ progress, note
  */
 router.patch("/:id", auth, async (c) => {
-    const db = getDb((c as any).env);
-    const u = c.get("user") as { id: number; role?: string };
-    const id = Number(c.req.param("id"));
+  const db = getDb((c as any).env);
+  const u = c.get("user") as { id: number; role?: string };
+  const id = Number(c.req.param("id"));
 
-    let body: unknown;
-    try {
-        body = await c.req.json();
-    } catch {
-        return c.json({ error: "Invalid JSON" }, 400);
-    }
+  let body: unknown;
+  try { body = await c.req.json(); } catch { return c.json({ error: "Invalid JSON" }, 400); }
+  const parsed = UpdateTaskSchema.safeParse(body);
+  if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400);
+  const d = parsed.data;
 
-    const parsed = UpdateTaskSchema.safeParse(body);
-    if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400);
-    const d = parsed.data;
-
-    // ตรวจสิทธิ์เข้าถึงงานนี้
-    const visible = isBossOrAdmin(u)
-        ? db`TRUE`
-        : db`EXISTS (
-         SELECT 1
-         FROM task_assignees ta
-         WHERE ta.task_id = ${id} AND ta.user_id = ${u.id}
-       )`;
-
-    const canRead = await db`
-    SELECT 1 FROM tasks t WHERE t.id = ${id} AND ${visible}
-  `;
-    if (!canRead.length) return c.json({ error: "forbidden" }, 403);
-
-    // Build SET ตามสิทธิ์ (ใช้ db.join แทนการ String().join)
-    const sets: any[] = [];
-
-    const push = (frag: any) => sets.push(frag);
-
-    if (isBossOrAdmin(u)) {
-        if (d.title !== undefined) push(db`title = ${d.title}`);
-        if (d.jobType !== undefined) push(db`job_type = ${d.jobType}`);
-        if (d.startDate !== undefined) push(db`start_date = ${d.startDate}`);
-        if (d.endDate !== undefined) push(db`end_date = ${d.endDate}`);
-        if (d.area !== undefined) push(db`area = ${d.area}`);
-        if (d.trucks !== undefined) push(db`trucks = ${d.trucks}`);
-        if (d.totalAmount !== undefined) push(db`total_amount = ${d.totalAmount}`);
-        if (d.paidAmount !== undefined) push(db`paid_amount = ${d.paidAmount}`);
-        if (d.status !== undefined) push(db`status = ${d.status}`);
-        if (d.color !== undefined) push(db`color = ${d.color}`);
-        if (d.tags !== undefined) push(db`tags = ${d.tags}`);
-
-        if (d.assigneeIds || d.assigneeUsernames) {
-            await db`DELETE FROM task_assignees WHERE task_id = ${id}`;
-            if (d.assigneeIds?.length) {
-                for (const uid of d.assigneeIds) {
-                    await db`
-            INSERT INTO task_assignees (task_id, user_id)
-            VALUES (${id}, ${uid})
-            ON CONFLICT DO NOTHING
-          `;
-                }
-            } else if (d.assigneeUsernames?.length) {
-                const urows = await db<{ id: number }>`
-          SELECT id FROM users WHERE username = ANY(${d.assigneeUsernames})
-        `;
-                for (const u2 of urows) {
-                    await db`
-            INSERT INTO task_assignees (task_id, user_id)
-            VALUES (${id}, ${u2.id})
-            ON CONFLICT DO NOTHING
-          `;
-                }
-            }
-        }
-    }
-
-    // ฟิลด์ที่ user แก้ได้
-    if (d.progress !== undefined) push(db`progress = ${d.progress}`);
-    if (d.note !== undefined) push(db`note = ${d.note}`);
-
-    if (sets.length) {
-        await db`
-      UPDATE tasks
-      SET ${db.join(sets, db`, `)}
-      WHERE id = ${id}
+  // ตรวจสิทธิ์อ่าน (ใช้ JOIN สำหรับ user ปกติ)
+  if (isBossOrAdmin(u)) {
+    const can = await db`SELECT 1 FROM tasks WHERE id = ${id} LIMIT 1`;
+    if (!can.length) return c.json({ error: "forbidden" }, 403);
+  } else {
+    const can = await db/*sql*/`
+      SELECT 1
+      FROM tasks t
+      JOIN task_assignees ta_v
+        ON ta_v.task_id = t.id
+       AND ta_v.user_id = ${u.id}
+      WHERE t.id = ${id}
+      LIMIT 1
     `;
-    }
+    if (!can.length) return c.json({ error: "forbidden" }, 403);
+  }
 
-    return c.json({ message: "updated" });
+  const admin = isBossOrAdmin(u);
+
+  const titleVal = admin ? d.title : undefined;
+  const jobTypeVal = admin ? d.jobType : undefined;
+  const startDateVal = admin ? d.startDate : undefined;
+  const endDateVal = admin ? d.endDate : undefined;
+  const areaVal = admin ? d.area : undefined;
+  const trucksVal = admin ? d.trucks : undefined;
+  const totalAmountVal = admin ? d.totalAmount : undefined;
+  const paidAmountVal = admin ? d.paidAmount : undefined;
+  const statusVal = admin ? d.status : undefined;
+  const colorVal = admin ? d.color : undefined;
+  const tagsVal = admin ? d.tags : undefined;
+
+  const progressVal = d.progress !== undefined ? d.progress : undefined;
+  const noteVal = d.note !== undefined ? d.note : undefined;
+
+  const updated = await db/*sql*/`
+    UPDATE tasks SET
+      title        = COALESCE(${titleVal},       title),
+      job_type     = COALESCE(${jobTypeVal},     job_type),
+      start_date   = COALESCE(${startDateVal},   start_date),
+      end_date     = COALESCE(${endDateVal},     end_date),
+      area         = COALESCE(${areaVal},        area),
+      trucks       = COALESCE(${trucksVal},      trucks),
+      total_amount = COALESCE(${totalAmountVal}, total_amount),
+      paid_amount  = COALESCE(${paidAmountVal},  paid_amount),
+      status       = COALESCE(${statusVal},      status),
+      color        = COALESCE(${colorVal},       color),
+      tags         = COALESCE(${tagsVal},        tags),
+      progress     = COALESCE(${progressVal},    progress),
+      note         = COALESCE(${noteVal},        note)
+    WHERE id = ${id}
+    RETURNING *
+  `;
+
+  if (!updated.length) {
+    // โดยปกติไม่ควรเกิด เพราะผ่านสิทธิ์แล้ว แต่อย่างไรเผื่อไว้
+    return c.json({ error: "not_found" }, 404);
+  }
+
+  // ถ้า admin เปลี่ยน assignees ให้รีเฟรชความสัมพันธ์
+  if (admin && (d.assigneeIds || d.assigneeUsernames)) {
+    await db`DELETE FROM task_assignees WHERE task_id = ${id}`;
+    if (d.assigneeIds?.length) {
+      for (const uid of d.assigneeIds) {
+        await db`INSERT INTO task_assignees (task_id, user_id) VALUES (${id}, ${uid}) ON CONFLICT DO NOTHING`;
+      }
+    } else if (d.assigneeUsernames?.length) {
+      const urows = await db<{ id: number }>`
+        SELECT id FROM users WHERE username = ANY(${d.assigneeUsernames})
+      `;
+      for (const u2 of urows) {
+        await db`INSERT INTO task_assignees (task_id, user_id) VALUES (${id}, ${u2.id}) ON CONFLICT DO NOTHING`;
+      }
+    }
+  }
+
+  // อ่าน assignees แนบกลับไปใน response
+  const assignees = await db/*sql*/`
+    SELECT json_agg(json_build_object('id', u2.id, 'username', u2.username) ORDER BY u2.username) AS assignees
+    FROM task_assignees ta
+    JOIN users u2 ON u2.id = ta.user_id
+    WHERE ta.task_id = ${id}
+  `;
+  const task = { ...updated[0], assignees: assignees[0]?.assignees ?? [] };
+
+  return c.json({ message: "updated", task });
 });
 
-/** POST /tasks/:id/payments — ให้ boss/admin เท่านั้น */
+/** POST /tasks/:id/payments — boss/admin เท่านั้น */
 router.post("/:id/payments", auth, requireRole(["boss", "admin"]), async (c) => {
-    const db = getDb((c as any).env);
-    const id = Number(c.req.param("id"));
-    const body = await c.req.json().catch(() => ({}));
-    const amount = Number(body?.amount || 0);
-    const note = body?.note ?? null;
+  const db = getDb((c as any).env);
+  const id = Number(c.req.param("id"));
+  const body = await c.req.json().catch(() => ({}));
+  const amount = Number(body?.amount || 0);
+  const note = body?.note ?? null;
 
-    if (!Number.isInteger(amount) || amount <= 0) {
-        return c.json({ error: "amount invalid" }, 400);
-    }
+  if (!Number.isInteger(amount) || amount <= 0) {
+    return c.json({ error: "amount invalid" }, 400);
+  }
 
-    await db`
+  await db`
     INSERT INTO task_payments (task_id, amount, note)
     VALUES (${id}, ${amount}, ${note})
   `;
-    await db`
+  await db`
     UPDATE tasks SET paid_amount = paid_amount + ${amount}
     WHERE id = ${id}
   `;
 
-    return c.json({ message: "payment recorded" }, 201);
+  return c.json({ message: "payment recorded" }, 201);
 });
 
 export default router;
