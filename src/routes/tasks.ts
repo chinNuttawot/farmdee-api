@@ -10,13 +10,14 @@ const router = new Hono();
 /** GET /tasks
  * boss/admin: เห็นทั้งหมด
  * user: เห็นเฉพาะงานที่ตัวเองถูก assign
+ * รองรับ query: ?from=YYYY-MM-DD&to=YYYY-MM-DD&status=...&jobType=...
  */
 router.get("/", auth, async (c) => {
   const db = getDb((c as any).env);
   const u = c.get("user") as { id: number; role?: string };
 
   const q = c.req.query();
-  const fromParam = q.from ?? null;
+  const fromParam = q.from ?? null;       // YYYY-MM-DD
   const toParam = q.to ?? null;
   const statusParam = q.status ?? null;
   const jobTypeParam = q.jobType ?? null;
@@ -25,21 +26,22 @@ router.get("/", auth, async (c) => {
     const rows = await db/*sql*/`
       SELECT
         t.*,
-        COALESCE((
-          SELECT json_agg(
-                   json_build_object('id', u2.id, 'username', u2.username)
-                   ORDER BY u2.username
-                 )
-          FROM task_assignees ta
-          JOIN users u2 ON u2.id = ta.user_id
-          WHERE ta.task_id = t.id
-        ), '[]'::json) AS assignees
+        COALESCE(a.assignees, '[]'::json) AS assignees
       FROM tasks t
+      LEFT JOIN LATERAL (
+        SELECT json_agg(
+                 json_build_object('id', u2.id, 'username', u2.username)
+                 ORDER BY u2.username
+               ) AS assignees
+        FROM task_assignees ta
+        JOIN users u2 ON u2.id = ta.user_id
+        WHERE ta.task_id = t.id
+      ) a ON TRUE
       WHERE
-        t.start_date >= COALESCE(${fromParam}, t.start_date)
-        AND t.end_date   <= COALESCE(${toParam},   t.end_date)
-        AND t.status     =  COALESCE(${statusParam},  t.status)
-        AND t.job_type   =  COALESCE(${jobTypeParam}, t.job_type)
+        (${fromParam}::date IS NULL OR t.start_date >= ${fromParam}::date)
+        AND (${toParam}::date IS NULL OR t.end_date   <= ${toParam}::date)
+        AND (${statusParam}::text IS NULL OR t.status   = ${statusParam}::text)
+        AND (${jobTypeParam}::text IS NULL OR t.job_type = ${jobTypeParam}::text)
       ORDER BY t.start_date ASC, t.id ASC
     `;
     return c.json(rows);
@@ -47,24 +49,25 @@ router.get("/", auth, async (c) => {
     const rows = await db/*sql*/`
       SELECT
         t.*,
-        COALESCE((
-          SELECT json_agg(
-                   json_build_object('id', u2.id, 'username', u2.username)
-                   ORDER BY u2.username
-                 )
-          FROM task_assignees ta
-          JOIN users u2 ON u2.id = ta.user_id
-          WHERE ta.task_id = t.id
-        ), '[]'::json) AS assignees
+        COALESCE(a.assignees, '[]'::json) AS assignees
       FROM tasks t
       JOIN task_assignees ta_v
         ON ta_v.task_id = t.id
        AND ta_v.user_id = ${u.id}
+      LEFT JOIN LATERAL (
+        SELECT json_agg(
+                 json_build_object('id', u2.id, 'username', u2.username)
+                 ORDER BY u2.username
+               ) AS assignees
+        FROM task_assignees ta
+        JOIN users u2 ON u2.id = ta.user_id
+        WHERE ta.task_id = t.id
+      ) a ON TRUE
       WHERE
-        t.start_date >= COALESCE(${fromParam}, t.start_date)
-        AND t.end_date   <= COALESCE(${toParam},   t.end_date)
-        AND t.status     =  COALESCE(${statusParam},  t.status)
-        AND t.job_type   =  COALESCE(${jobTypeParam}, t.job_type)
+        (${fromParam}::date IS NULL OR t.start_date >= ${fromParam}::date)
+        AND (${toParam}::date IS NULL OR t.end_date   <= ${toParam}::date)
+        AND (${statusParam}::text IS NULL OR t.status   = ${statusParam}::text)
+        AND (${jobTypeParam}::text IS NULL OR t.job_type = ${jobTypeParam}::text)
       ORDER BY t.start_date ASC, t.id ASC
     `;
     return c.json(rows);
@@ -77,13 +80,11 @@ router.get("/:id", auth, async (c) => {
   const u = c.get("user") as { id: number; role?: string };
   const id = Number(c.req.param("id"));
 
-  // 1) มี task นี้ไหม
   const exists = await db`SELECT 1 FROM tasks WHERE id = ${id} LIMIT 1`;
   if (!exists.length) return c.json({ error: "not_found" }, 404);
 
-  // 2) มีสิทธิ์เห็นไหม
   if (!isBossOrAdmin(u)) {
-    const canSee = await db`
+    const canSee = await db/*sql*/`
       SELECT 1
       FROM task_assignees
       WHERE task_id = ${id} AND user_id = ${u.id}
@@ -92,20 +93,20 @@ router.get("/:id", auth, async (c) => {
     if (!canSee.length) return c.json({ error: "forbidden" }, 403);
   }
 
-  // 3) ดึงข้อมูล + assignees
   const rows = await db/*sql*/`
     SELECT
       t.*,
-      COALESCE((
-        SELECT json_agg(
-                 json_build_object('id', u2.id, 'username', u2.username)
-                 ORDER BY u2.username
-               )
-        FROM task_assignees ta
-        JOIN users u2 ON u2.id = ta.user_id
-        WHERE ta.task_id = t.id
-      ), '[]'::json) AS assignees
+      COALESCE(a.assignees, '[]'::json) AS assignees
     FROM tasks t
+    LEFT JOIN LATERAL (
+      SELECT json_agg(
+               json_build_object('id', u2.id, 'username', u2.username)
+               ORDER BY u2.username
+             ) AS assignees
+      FROM task_assignees ta
+      JOIN users u2 ON u2.id = ta.user_id
+      WHERE ta.task_id = t.id
+    ) a ON TRUE
     WHERE t.id = ${id}
     LIMIT 1
   `;
@@ -128,24 +129,43 @@ router.post("/", auth, requireRole(["boss", "admin"]), async (c) => {
       title, job_type, start_date, end_date, area, trucks,
       total_amount, paid_amount, note, status, color, tags, progress, created_by
     ) VALUES (
-      ${d.title}, ${d.jobType}, ${d.startDate}, ${d.endDate},
-      ${d.area ?? null}, ${d.trucks ?? null},
-      ${d.totalAmount}, ${d.paidAmount ?? 0},
-      ${d.note ?? null}, ${d.status ?? 'รอทำ'},
-      ${d.color ?? null}, ${d.tags ?? []},
-      0, ${creator.id}
-    ) RETURNING id
+      ${d.title}::text,
+      ${d.jobType}::text,
+      ${d.startDate}::date,
+      ${d.endDate}::date,
+      ${d.area ?? null}::text,
+      ${d.trucks ?? null}::int,
+      ${d.totalAmount}::int,
+      ${d.paidAmount ?? 0}::int,
+      ${d.note ?? null}::text,
+      ${d.status ?? 'รอทำ'}::text,
+      ${d.color ?? null}::text,
+      ${d.tags ?? []}::jsonb,
+      ${0.0}::numeric(3,1),
+      ${creator.id}::int
+    )
+    RETURNING id
   `;
   const taskId = trow[0].id;
 
-  if (d.assigneeIds?.length) {
+  if (Array.isArray(d.assigneeIds) && d.assigneeIds.length > 0) {
     for (const uid of d.assigneeIds) {
-      await db`INSERT INTO task_assignees (task_id, user_id) VALUES (${taskId}, ${uid}) ON CONFLICT DO NOTHING`;
+      await db/*sql*/`
+        INSERT INTO task_assignees (task_id, user_id)
+        VALUES (${taskId}::int, ${uid}::int)
+        ON CONFLICT DO NOTHING
+      `;
     }
-  } else if (d.assigneeUsernames?.length) {
-    const urows = await db<{ id: number }>`SELECT id FROM users WHERE username = ANY(${d.assigneeUsernames})`;
+  } else if (Array.isArray(d.assigneeUsernames) && d.assigneeUsernames.length > 0) {
+    const urows = await db<{ id: number }>`
+      SELECT id FROM users WHERE username = ANY(${d.assigneeUsernames}::text[])
+    `;
     for (const u2 of urows) {
-      await db`INSERT INTO task_assignees (task_id, user_id) VALUES (${taskId}, ${u2.id}) ON CONFLICT DO NOTHING`;
+      await db/*sql*/`
+        INSERT INTO task_assignees (task_id, user_id)
+        VALUES (${taskId}::int, ${u2.id}::int)
+        ON CONFLICT DO NOTHING
+      `;
     }
   }
 
@@ -167,82 +187,121 @@ router.patch("/:id", auth, async (c) => {
   if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400);
   const d = parsed.data;
 
-  // ตรวจสิทธิ์อ่าน (ใช้ JOIN สำหรับ user ปกติ)
-  if (isBossOrAdmin(u)) {
-    const can = await db`SELECT 1 FROM tasks WHERE id = ${id} LIMIT 1`;
-    if (!can.length) return c.json({ error: "forbidden" }, 403);
-  } else {
-    const can = await db/*sql*/`
-      SELECT 1
-      FROM tasks t
-      JOIN task_assignees ta_v
-        ON ta_v.task_id = t.id
-       AND ta_v.user_id = ${u.id}
-      WHERE t.id = ${id}
-      LIMIT 1
-    `;
-    if (!can.length) return c.json({ error: "forbidden" }, 403);
-  }
+  // check permission to see the task
+  const can = isBossOrAdmin(u)
+    ? await db`SELECT 1 FROM tasks WHERE id = ${id} LIMIT 1`
+    : await db/*sql*/`
+        SELECT 1
+        FROM tasks t
+        JOIN task_assignees ta_v
+          ON ta_v.task_id = t.id
+         AND ta_v.user_id = ${u.id}
+        WHERE t.id = ${id}
+        LIMIT 1
+      `;
+  if (!can.length) return c.json({ error: "forbidden" }, 403);
 
   const admin = isBossOrAdmin(u);
 
-  const titleVal = admin ? d.title : undefined;
-  const jobTypeVal = admin ? d.jobType : undefined;
-  const startDateVal = admin ? d.startDate : undefined;
-  const endDateVal = admin ? d.endDate : undefined;
-  const areaVal = admin ? d.area : undefined;
-  const trucksVal = admin ? d.trucks : undefined;
-  const totalAmountVal = admin ? d.totalAmount : undefined;
-  const paidAmountVal = admin ? d.paidAmount : undefined;
-  const statusVal = admin ? d.status : undefined;
-  const colorVal = admin ? d.color : undefined;
-  const tagsVal = admin ? d.tags : undefined;
+  // -------- USER (non-admin): update เฉพาะ progress, note --------
+  if (!admin) {
+    const progressVal = d.progress ?? null; // 0..1 หรือ null = ไม่อัปเดต
+    const noteVal = d.note ?? undefined;
 
-  const progressVal = d.progress !== undefined ? d.progress : undefined;
-  const noteVal = d.note !== undefined ? d.note : undefined;
+    const updated = await db/*sql*/`
+      UPDATE tasks SET
+        progress = CASE
+          WHEN (${progressVal}::numeric(3,1)) IS NULL THEN progress
+          ELSE GREATEST(
+                 0.0::numeric(3,1),
+                 LEAST(1.0::numeric(3,1), (${progressVal})::numeric(3,1))
+               )
+        END,
+        note = COALESCE(${noteVal}::text, note)
+      WHERE id = ${id}
+      RETURNING *
+    `;
+
+    if (!updated.length) return c.json({ error: "not_found" }, 404);
+
+    const assignees = await db/*sql*/`
+      SELECT json_agg(json_build_object('id', u2.id, 'username', u2.username) ORDER BY u2.username) AS assignees
+      FROM task_assignees ta
+      JOIN users u2 ON u2.id = ta.user_id
+      WHERE ta.task_id = ${id}
+    `;
+    const task = { ...updated[0], assignees: assignees[0]?.assignees ?? [] };
+    return c.json({ message: "updated", task });
+  }
+
+  // -------- ADMIN: update ได้ทุกฟิลด์ --------
+  const titleVal = d.title ?? null;
+  const jobTypeVal = d.jobType ?? null;
+  const startDateVal = d.startDate ?? null;
+  const endDateVal = d.endDate ?? null;
+  const areaVal = d.area ?? null;
+  const trucksVal = d.trucks ?? null;
+  const totalAmountVal = d.totalAmount ?? null;
+  const paidAmountVal = d.paidAmount ?? null;
+  const statusVal = d.status ?? null;
+  const colorVal = d.color ?? null;
+  const tagsVal = d.tags ?? null;
+
+  const progressVal = d.progress ?? null;
+  const noteVal = d.note ?? undefined;
 
   const updated = await db/*sql*/`
     UPDATE tasks SET
-      title        = COALESCE(${titleVal},       title),
-      job_type     = COALESCE(${jobTypeVal},     job_type),
-      start_date   = COALESCE(${startDateVal},   start_date),
-      end_date     = COALESCE(${endDateVal},     end_date),
-      area         = COALESCE(${areaVal},        area),
-      trucks       = COALESCE(${trucksVal},      trucks),
-      total_amount = COALESCE(${totalAmountVal}, total_amount),
-      paid_amount  = COALESCE(${paidAmountVal},  paid_amount),
-      status       = COALESCE(${statusVal},      status),
-      color        = COALESCE(${colorVal},       color),
-      tags         = COALESCE(${tagsVal},        tags),
-      progress     = COALESCE(${progressVal},    progress),
-      note         = COALESCE(${noteVal},        note)
+      title        = COALESCE(${titleVal}::text,        title),
+      job_type     = COALESCE(${jobTypeVal}::text,      job_type),
+      start_date   = COALESCE(${startDateVal}::date,    start_date),
+      end_date     = COALESCE(${endDateVal}::date,      end_date),
+      area         = COALESCE(${areaVal}::text,         area),
+      trucks       = COALESCE(${trucksVal}::int,        trucks),
+      total_amount = COALESCE(${totalAmountVal}::int,   total_amount),
+      paid_amount  = COALESCE(${paidAmountVal}::int,    paid_amount),
+      status       = COALESCE(${statusVal}::text,       status),
+      color        = COALESCE(${colorVal}::text,        color),
+      tags         = COALESCE(${tagsVal}::jsonb,        tags),
+      progress     = CASE
+                       WHEN (${progressVal}::numeric(3,1)) IS NULL THEN progress
+                       ELSE GREATEST(
+                              0.0::numeric(3,1),
+                              LEAST(1.0::numeric(3,1), (${progressVal})::numeric(3,1))
+                            )
+                     END,
+      note         = COALESCE(${noteVal}::text,         note)
     WHERE id = ${id}
     RETURNING *
   `;
 
-  if (!updated.length) {
-    // โดยปกติไม่ควรเกิด เพราะผ่านสิทธิ์แล้ว แต่อย่างไรเผื่อไว้
-    return c.json({ error: "not_found" }, 404);
-  }
+  if (!updated.length) return c.json({ error: "not_found" }, 404);
 
-  // ถ้า admin เปลี่ยน assignees ให้รีเฟรชความสัมพันธ์
-  if (admin && (d.assigneeIds || d.assigneeUsernames)) {
+  // refresh assignees if admin changed them
+  if (Array.isArray(d.assigneeIds) || Array.isArray(d.assigneeUsernames)) {
     await db`DELETE FROM task_assignees WHERE task_id = ${id}`;
-    if (d.assigneeIds?.length) {
+    if (Array.isArray(d.assigneeIds) && d.assigneeIds.length > 0) {
       for (const uid of d.assigneeIds) {
-        await db`INSERT INTO task_assignees (task_id, user_id) VALUES (${id}, ${uid}) ON CONFLICT DO NOTHING`;
+        await db/*sql*/`
+          INSERT INTO task_assignees (task_id, user_id)
+          VALUES (${id}::int, ${uid}::int)
+          ON CONFLICT DO NOTHING
+        `;
       }
-    } else if (d.assigneeUsernames?.length) {
+    } else if (Array.isArray(d.assigneeUsernames) && d.assigneeUsernames.length > 0) {
       const urows = await db<{ id: number }>`
-        SELECT id FROM users WHERE username = ANY(${d.assigneeUsernames})
+        SELECT id FROM users WHERE username = ANY(${d.assigneeUsernames}::text[])
       `;
       for (const u2 of urows) {
-        await db`INSERT INTO task_assignees (task_id, user_id) VALUES (${id}, ${u2.id}) ON CONFLICT DO NOTHING`;
+        await db/*sql*/`
+          INSERT INTO task_assignees (task_id, user_id)
+          VALUES (${id}::int, ${u2.id}::int)
+          ON CONFLICT DO NOTHING
+        `;
       }
     }
   }
 
-  // อ่าน assignees แนบกลับไปใน response
   const assignees = await db/*sql*/`
     SELECT json_agg(json_build_object('id', u2.id, 'username', u2.username) ORDER BY u2.username) AS assignees
     FROM task_assignees ta
@@ -250,7 +309,6 @@ router.patch("/:id", auth, async (c) => {
     WHERE ta.task_id = ${id}
   `;
   const task = { ...updated[0], assignees: assignees[0]?.assignees ?? [] };
-
   return c.json({ message: "updated", task });
 });
 
@@ -266,13 +324,13 @@ router.post("/:id/payments", auth, requireRole(["boss", "admin"]), async (c) => 
     return c.json({ error: "amount invalid" }, 400);
   }
 
-  await db`
+  await db/*sql*/`
     INSERT INTO task_payments (task_id, amount, note)
-    VALUES (${id}, ${amount}, ${note})
+    VALUES (${id}::int, ${amount}::int, ${note}::text)
   `;
-  await db`
-    UPDATE tasks SET paid_amount = paid_amount + ${amount}
-    WHERE id = ${id}
+  await db/*sql*/`
+    UPDATE tasks SET paid_amount = paid_amount + ${amount}::int
+    WHERE id = ${id}::int
   `;
 
   return c.json({ message: "payment recorded" }, 201);
