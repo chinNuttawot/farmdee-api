@@ -7,7 +7,64 @@ import { CreateTaskSchema, UpdateTaskSchema } from "../schemas/task";
 
 const router = new Hono();
 
-/** GET /tasks */
+/** -------- helpers -------- */
+async function upsertAssignees(db: any, taskId: number, list: any[]) {
+  for (const cfg of list) {
+    // หาตาม id หรือ username
+    let uid = cfg.userId as number | undefined;
+    if (!uid && cfg.username) {
+      const urow = await db<{ id: number }>`
+        SELECT id FROM users WHERE username = ${cfg.username}::text LIMIT 1
+      `;
+      uid = urow[0]?.id;
+    }
+    if (!uid) continue;
+
+    // ถ้า useDefault === true -> null ค่า custom ทั้งหมด
+    const useDefault = cfg.useDefault !== false; // default = true
+    const ratePerRai = useDefault ? null : (cfg.ratePerRai ?? null);
+    const repairRate = useDefault ? null : (cfg.repairRate ?? null);
+    const dailyRate = useDefault ? null : (cfg.dailyRate ?? null);
+
+    await db/*sql*/`
+      INSERT INTO task_assignees (
+        task_id, user_id, use_default,
+        rate_per_rai, repair_rate, daily_rate
+      ) VALUES (
+        ${taskId}::int, ${uid}::int, ${useDefault}::boolean,
+        ${ratePerRai}::numeric, ${repairRate}::numeric, ${dailyRate}::numeric
+      )
+      ON CONFLICT (task_id, user_id) DO UPDATE SET
+        use_default  = EXCLUDED.use_default,
+        rate_per_rai = EXCLUDED.rate_per_rai,
+        repair_rate  = EXCLUDED.repair_rate,
+        daily_rate   = EXCLUDED.daily_rate
+    `;
+  }
+}
+
+const assigneesJsonAgg = /*sql*/`
+  SELECT json_agg(
+           json_build_object(
+             'id', v.user_id,
+             'username', v.username,
+             'payType', v.pay_type,
+             'useDefault', v.use_default,
+             'ratePerRai', v.eff_rate_per_rai,
+             'repairRate', v.eff_repair_rate,
+             'dailyRate', v.eff_daily_rate
+           )
+           ORDER BY v.username
+         ) AS assignees
+  FROM v_task_assignees_effective v
+  WHERE v.task_id = t.id
+`;
+
+/** -------- GET /tasks --------
+ * boss/admin: เห็นทั้งหมด
+ * user: เห็นเฉพาะงานที่ตัวเองถูก assign
+ * รองรับ query: ?from=YYYY-MM-DD&to=YYYY-MM-DD&status=...&jobType=...
+ */
 router.get("/", auth, async (c) => {
   const db = getDb((c as any).env);
   const u = c.get("user") as { id: number; role?: string };
@@ -25,16 +82,13 @@ router.get("/", auth, async (c) => {
         COALESCE(a.assignees, '[]'::json) AS assignees
       FROM tasks t
       LEFT JOIN LATERAL (
-        SELECT json_agg(json_build_object('id', u2.id, 'username', u2.username) ORDER BY u2.username) AS assignees
-        FROM task_assignees ta
-        JOIN users u2 ON u2.id = ta.user_id
-        WHERE ta.task_id = t.id
+        ${assigneesJsonAgg}
       ) a ON TRUE
       WHERE
         (${fromParam}::date IS NULL OR t.start_date >= ${fromParam}::date)
-        AND (${toParam}::date IS NULL OR t.end_date   <= ${toParam}::date)
-        AND (${statusParam}::text IS NULL OR t.status   = ${statusParam}::text)
-        AND (${jobTypeParam}::text IS NULL OR t.job_type = ${jobTypeParam}::text)
+        AND (${toParam}::date   IS NULL OR t.end_date   <= ${toParam}::date)
+        AND (${statusParam}::text   IS NULL OR t.status   = ${statusParam}::text)
+        AND (${jobTypeParam}::text  IS NULL OR t.job_type = ${jobTypeParam}::text)
       ORDER BY t.start_date ASC, t.id ASC
     `;
     return c.json(rows);
@@ -48,23 +102,20 @@ router.get("/", auth, async (c) => {
         ON ta_v.task_id = t.id
        AND ta_v.user_id = ${u.id}
       LEFT JOIN LATERAL (
-        SELECT json_agg(json_build_object('id', u2.id, 'username', u2.username) ORDER BY u2.username) AS assignees
-        FROM task_assignees ta
-        JOIN users u2 ON u2.id = ta.user_id
-        WHERE ta.task_id = t.id
+        ${assigneesJsonAgg}
       ) a ON TRUE
       WHERE
         (${fromParam}::date IS NULL OR t.start_date >= ${fromParam}::date)
-        AND (${toParam}::date IS NULL OR t.end_date   <= ${toParam}::date)
-        AND (${statusParam}::text IS NULL OR t.status   = ${statusParam}::text)
-        AND (${jobTypeParam}::text IS NULL OR t.job_type = ${jobTypeParam}::text)
+        AND (${toParam}::date   IS NULL OR t.end_date   <= ${toParam}::date)
+        AND (${statusParam}::text   IS NULL OR t.status   = ${statusParam}::text)
+        AND (${jobTypeParam}::text  IS NULL OR t.job_type = ${jobTypeParam}::text)
       ORDER BY t.start_date ASC, t.id ASC
     `;
     return c.json(rows);
   }
 });
 
-/** GET /tasks/:id */
+/** -------- GET /tasks/:id -------- */
 router.get("/:id", auth, async (c) => {
   const db = getDb((c as any).env);
   const u = c.get("user") as { id: number; role?: string };
@@ -89,10 +140,7 @@ router.get("/:id", auth, async (c) => {
       COALESCE(a.assignees, '[]'::json) AS assignees
     FROM tasks t
     LEFT JOIN LATERAL (
-      SELECT json_agg(json_build_object('id', u2.id, 'username', u2.username) ORDER BY u2.username) AS assignees
-      FROM task_assignees ta
-      JOIN users u2 ON u2.id = ta.user_id
-      WHERE ta.task_id = t.id
+      ${assigneesJsonAgg}
     ) a ON TRUE
     WHERE t.id = ${id}
     LIMIT 1
@@ -100,7 +148,9 @@ router.get("/:id", auth, async (c) => {
   return c.json(rows[0]);
 });
 
-/** POST /tasks — boss/admin เท่านั้น */
+/** -------- POST /tasks (boss/admin) --------
+ * รองรับ assigneeConfigs: [{ userId|username, useDefault, ratePerRai, repairRate, dailyRate }]
+ */
 router.post("/", auth, requireRole(["boss", "admin"]), async (c) => {
   const db = getDb((c as any).env);
   const creator = c.get("user") as { id: number };
@@ -109,7 +159,7 @@ router.post("/", auth, requireRole(["boss", "admin"]), async (c) => {
   try { body = await c.req.json(); } catch { return c.json({ error: "Invalid JSON" }, 400); }
   const parsed = CreateTaskSchema.safeParse(body);
   if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400);
-  const d = parsed.data;
+  const d: any = parsed.data;
 
   const trow = await db<{ id: number }>`
     INSERT INTO tasks (
@@ -122,8 +172,8 @@ router.post("/", auth, requireRole(["boss", "admin"]), async (c) => {
       ${d.endDate}::date,
       ${d.area ?? null}::numeric,
       ${d.trucks ?? null}::int,
-      ${d.totalAmount}::int,
-      ${d.paidAmount ?? 0}::int,
+      ${d.totalAmount ?? 0}::int,   -- บันทึกเงินเฉพาะตอนสร้าง
+      ${d.paidAmount ?? 0}::int,  -- บันทึกเงินเฉพาะตอนสร้าง
       ${d.note ?? null}::text,
       ${d.status ?? 'รอทำ'}::text,
       ${d.color ?? null}::text,
@@ -135,31 +185,40 @@ router.post("/", auth, requireRole(["boss", "admin"]), async (c) => {
   `;
   const taskId = trow[0].id;
 
-  if (Array.isArray(d.assigneeIds) && d.assigneeIds.length > 0) {
-    for (const uid of d.assigneeIds) {
-      await db/*sql*/`
-        INSERT INTO task_assignees (task_id, user_id)
-        VALUES (${taskId}::int, ${uid}::int)
-        ON CONFLICT DO NOTHING
+  // 1) โหมดใหม่: assigneeConfigs
+  if (Array.isArray(d.assigneeConfigs) && d.assigneeConfigs.length > 0) {
+    await upsertAssignees(db, taskId, d.assigneeConfigs);
+  } else {
+    // 2) โหมดเดิม: ids หรือ usernames (จะถือว่าใช้ default ทั้งหมด)
+    if (Array.isArray(d.assigneeIds) && d.assigneeIds.length > 0) {
+      for (const uid of d.assigneeIds) {
+        await db/*sql*/`
+          INSERT INTO task_assignees (task_id, user_id, use_default)
+          VALUES (${taskId}::int, ${uid}::int, true)
+          ON CONFLICT DO NOTHING
+        `;
+      }
+    } else if (Array.isArray(d.assigneeUsernames) && d.assigneeUsernames.length > 0) {
+      const urows = await db<{ id: number }>`
+        SELECT id FROM users WHERE username = ANY(${d.assigneeUsernames}::text[])
       `;
-    }
-  } else if (Array.isArray(d.assigneeUsernames) && d.assigneeUsernames.length > 0) {
-    const urows = await db<{ id: number }>`
-      SELECT id FROM users WHERE username = ANY(${d.assigneeUsernames}::text[])
-    `;
-    for (const u2 of urows) {
-      await db/*sql*/`
-        INSERT INTO task_assignees (task_id, user_id)
-        VALUES (${taskId}::int, ${u2.id}::int)
-        ON CONFLICT DO NOTHING
-      `;
+      for (const u2 of urows) {
+        await db/*sql*/`
+          INSERT INTO task_assignees (task_id, user_id, use_default)
+          VALUES (${taskId}::int, ${u2.id}::int, true)
+          ON CONFLICT DO NOTHING
+        `;
+      }
     }
   }
 
   return c.json({ message: "created", id: taskId }, 201);
 });
 
-/** PATCH /tasks/:id */
+/** -------- PATCH /tasks/:id --------
+ * user: แก้ได้เฉพาะ progress, note
+ * boss/admin: แก้ได้หลายฟิลด์ แต่ "ไม่ให้แก้เงิน" (total_amount/paid_amount)
+ */
 router.patch("/:id", auth, async (c) => {
   const db = getDb((c as any).env);
   const u = c.get("user") as { id: number; role?: string };
@@ -169,7 +228,7 @@ router.patch("/:id", auth, async (c) => {
   try { body = await c.req.json(); } catch { return c.json({ error: "Invalid JSON" }, 400); }
   const parsed = UpdateTaskSchema.safeParse(body);
   if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400);
-  const d = parsed.data;
+  const d: any = parsed.data;
 
   // permission to see/update
   const can = isBossOrAdmin(u)
@@ -187,8 +246,8 @@ router.patch("/:id", auth, async (c) => {
 
   const admin = isBossOrAdmin(u);
 
-  // -------- USER: update เฉพาะ progress, note --------
   if (!admin) {
+    // ----- USER: progress/note เท่านั้น -----
     const progressVal = d.progress ?? null;
     const noteVal = d.note ?? undefined;
 
@@ -206,23 +265,21 @@ router.patch("/:id", auth, async (c) => {
     if (!updated.length) return c.json({ error: "not_found" }, 404);
 
     const assignees = await db/*sql*/`
-      SELECT json_agg(json_build_object('id', u2.id, 'username', u2.username) ORDER BY u2.username) AS assignees
-      FROM task_assignees ta
-      JOIN users u2 ON u2.id = ta.user_id
-      WHERE ta.task_id = ${id}
+      ${assigneesJsonAgg.replaceAll("t.id", `${id}`)}
     `;
-    return c.json({ message: "updated", task: { ...updated[0], assignees: assignees[0]?.assignees ?? [] } });
+    return c.json({
+      message: "updated",
+      task: { ...updated[0], assignees: (assignees as any)[0]?.assignees ?? [] },
+    });
   }
 
-  // -------- ADMIN: update ได้ทุกฟิลด์ --------
+  // ----- ADMIN: ห้ามอัปเดตเงิน -----
   const titleVal = d.title ?? null;
   const jobTypeVal = d.jobType ?? null;
   const startDateVal = d.startDate ?? null;
   const endDateVal = d.endDate ?? null;
   const areaVal = d.area ?? null;
   const trucksVal = d.trucks ?? null;
-  const totalAmountVal = d.totalAmount ?? null;
-  const paidAmountVal = d.paidAmount ?? null;
   const statusVal = d.status ?? null;
   const colorVal = d.color ?? null;
   const tagsVal = d.tags ?? null;
@@ -236,10 +293,8 @@ router.patch("/:id", auth, async (c) => {
       job_type     = COALESCE(${jobTypeVal}::text,      job_type),
       start_date   = COALESCE(${startDateVal}::date,    start_date),
       end_date     = COALESCE(${endDateVal}::date,      end_date),
-      area         = COALESCE(${areaVal}::numeric,      area),   -- ✅ area เป็นตัวเลข
+      area         = COALESCE(${areaVal}::numeric,      area),
       trucks       = COALESCE(${trucksVal}::int,        trucks),
-      total_amount = COALESCE(${totalAmountVal}::int,   total_amount),
-      paid_amount  = COALESCE(${paidAmountVal}::int,    paid_amount),
       status       = COALESCE(${statusVal}::text,       status),
       color        = COALESCE(${colorVal}::text,        color),
       tags         = COALESCE(${tagsVal}::text[],       tags),
@@ -254,14 +309,19 @@ router.patch("/:id", auth, async (c) => {
   `;
   if (!updated.length) return c.json({ error: "not_found" }, 404);
 
-  // refresh assignees if admin changed them
-  if (Array.isArray(d.assigneeIds) || Array.isArray(d.assigneeUsernames)) {
+  // อัปเดตผู้รับงานถ้าส่ง assigneeConfigs มา
+  if (Array.isArray(d.assigneeConfigs)) {
+    // เลือกวิธีรีเฟรชทั้งชุดเพื่อให้ตรงกับ UI
+    await db`DELETE FROM task_assignees WHERE task_id = ${id}`;
+    await upsertAssignees(db, id, d.assigneeConfigs);
+  } else if (Array.isArray(d.assigneeIds) || Array.isArray(d.assigneeUsernames)) {
+    // โหมดเดิม: ถือว่าใช้ default ทั้งหมด
     await db`DELETE FROM task_assignees WHERE task_id = ${id}`;
     if (Array.isArray(d.assigneeIds) && d.assigneeIds.length > 0) {
       for (const uid of d.assigneeIds) {
         await db/*sql*/`
-          INSERT INTO task_assignees (task_id, user_id)
-          VALUES (${id}::int, ${uid}::int)
+          INSERT INTO task_assignees (task_id, user_id, use_default)
+          VALUES (${id}::int, ${uid}::int, true)
           ON CONFLICT DO NOTHING
         `;
       }
@@ -271,8 +331,8 @@ router.patch("/:id", auth, async (c) => {
       `;
       for (const u2 of urows) {
         await db/*sql*/`
-          INSERT INTO task_assignees (task_id, user_id)
-          VALUES (${id}::int, ${u2.id}::int)
+          INSERT INTO task_assignees (task_id, user_id, use_default)
+          VALUES (${id}::int, ${u2.id}::int, true)
           ON CONFLICT DO NOTHING
         `;
       }
@@ -280,15 +340,15 @@ router.patch("/:id", auth, async (c) => {
   }
 
   const assignees = await db/*sql*/`
-    SELECT json_agg(json_build_object('id', u2.id, 'username', u2.username) ORDER BY u2.username) AS assignees
-    FROM task_assignees ta
-    JOIN users u2 ON u2.id = ta.user_id
-    WHERE ta.task_id = ${id}
+    ${assigneesJsonAgg.replaceAll("t.id", `${id}`)}
   `;
-  return c.json({ message: "updated", task: { ...updated[0], assignees: assignees[0]?.assignees ?? [] } });
+  return c.json({
+    message: "updated",
+    task: { ...updated[0], assignees: (assignees as any)[0]?.assignees ?? [] },
+  });
 });
 
-/** POST /tasks/:id/payments — boss/admin เท่านั้น */
+/** -------- POST /tasks/:id/payments (boss/admin) -------- */
 router.post("/:id/payments", auth, requireRole(["boss", "admin"]), async (c) => {
   const db = getDb((c as any).env);
   const id = Number(c.req.param("id"));
