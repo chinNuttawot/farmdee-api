@@ -1,18 +1,21 @@
 {
-	"name": "my-worker",
-	"version": "0.0.0",
+	"name": "framdee-auth-worker",
+	"version": "1.0.0",
 	"private": true,
+	"type": "module",
 	"scripts": {
-		"deploy": "wrangler deploy",
 		"dev": "wrangler dev",
-		"start": "wrangler dev",
-		"test": "vitest",
-		"cf-typegen": "wrangler types"
+		"deploy": "wrangler deploy",
+		"check": "tsc --noEmit",
+		"debug": "npx wrangler tail"
+	},
+	"dependencies": {
+		"@neondatabase/serverless": "^0.10.2",
+		"hono": "^4.4.7",
+		"zod": "^3.23.8"
 	},
 	"devDependencies": {
-		"@cloudflare/vitest-pool-workers": "^0.8.19",
-		"typescript": "^5.5.2",
-		"vitest": "~3.2.0",
+		"typescript": "^5.4.5",
 		"wrangler": "^4.37.0"
 	}
 }

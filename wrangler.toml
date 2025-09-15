@@ -1,0 +1,7 @@
+name = "framdee-auth-worker"
+main = "src/index.ts"
+compatibility_date = "2024-09-10"
+
+[vars]
+CORS_ALLOW_ORIGIN = "*"
+PBKDF2_ITER = "100000"
