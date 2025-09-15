@@ -10,5 +10,6 @@ export type SlimUser = {
     id: number;
     username: string;
     email: string | null;
+    role: "admin" | "boss" | "user";
     created_at: string;
 };
