@@ -42,22 +42,30 @@ async function upsertAssignees(db: any, taskId: number, list: any[]) {
   }
 }
 
-const assigneesJsonAgg = /*sql*/`
-  SELECT json_agg(
-           json_build_object(
-             'id', v.user_id,
-             'username', v.username,
-             'payType', v.pay_type,
-             'useDefault', v.use_default,
-             'ratePerRai', v.eff_rate_per_rai,
-             'repairRate', v.eff_repair_rate,
-             'dailyRate', v.eff_daily_rate
-           )
-           ORDER BY v.username
-         ) AS assignees
-  FROM v_task_assignees_effective v
-  WHERE v.task_id = t.id
-`;
+/** คืน JSON ของ assignees ด้วย taskId (ใช้ตอนที่ไม่มีตาราง t ให้ join) */
+async function fetchAssigneesJson(db: any, taskId: number) {
+  const rows = await db/*sql*/`
+    SELECT
+      COALESCE(
+        json_agg(
+          json_build_object(
+            'id', v.user_id,
+            'username', v.username,
+            'payType', v.pay_type,
+            'useDefault', v.use_default,
+            'ratePerRai', v.eff_rate_per_rai,
+            'repairRate', v.eff_repair_rate,
+            'dailyRate', v.eff_daily_rate
+          )
+          ORDER BY v.username
+        ),
+        '[]'::json
+      ) AS assignees
+    FROM v_task_assignees_effective v
+    WHERE v.task_id = ${taskId}::int
+  `;
+  return rows[0]?.assignees ?? [];
+}
 
 /** -------- GET /tasks -------- */
 router.get("/", auth, async (c) => {
@@ -76,7 +84,23 @@ router.get("/", auth, async (c) => {
         t.*,
         COALESCE(a.assignees, '[]'::json) AS assignees
       FROM tasks t
-      LEFT JOIN LATERAL (${assigneesJsonAgg}) a ON TRUE
+      LEFT JOIN LATERAL (
+        SELECT
+          json_agg(
+            json_build_object(
+              'id', v.user_id,
+              'username', v.username,
+              'payType', v.pay_type,
+              'useDefault', v.use_default,
+              'ratePerRai', v.eff_rate_per_rai,
+              'repairRate', v.eff_repair_rate,
+              'dailyRate', v.eff_daily_rate
+            )
+            ORDER BY v.username
+          ) AS assignees
+        FROM v_task_assignees_effective v
+        WHERE v.task_id = t.id
+      ) a ON TRUE
       WHERE
         (${fromParam}::date IS NULL OR t.start_date >= ${fromParam}::date)
         AND (${toParam}::date   IS NULL OR t.end_date   <= ${toParam}::date)
@@ -94,7 +118,23 @@ router.get("/", auth, async (c) => {
       JOIN task_assignees ta_v
         ON ta_v.task_id = t.id
        AND ta_v.user_id = ${u.id}
-      LEFT JOIN LATERAL (${assigneesJsonAgg}) a ON TRUE
+      LEFT JOIN LATERAL (
+        SELECT
+          json_agg(
+            json_build_object(
+              'id', v.user_id,
+              'username', v.username,
+              'payType', v.pay_type,
+              'useDefault', v.use_default,
+              'ratePerRai', v.eff_rate_per_rai,
+              'repairRate', v.eff_repair_rate,
+              'dailyRate', v.eff_daily_rate
+            )
+            ORDER BY v.username
+          ) AS assignees
+        FROM v_task_assignees_effective v
+        WHERE v.task_id = t.id
+      ) a ON TRUE
       WHERE
         (${fromParam}::date IS NULL OR t.start_date >= ${fromParam}::date)
         AND (${toParam}::date   IS NULL OR t.end_date   <= ${toParam}::date)
@@ -130,7 +170,23 @@ router.get("/:id", auth, async (c) => {
       t.*,
       COALESCE(a.assignees, '[]'::json) AS assignees
     FROM tasks t
-    LEFT JOIN LATERAL (${assigneesJsonAgg}) a ON TRUE
+    LEFT JOIN LATERAL (
+      SELECT
+        json_agg(
+          json_build_object(
+            'id', v.user_id,
+            'username', v.username,
+            'payType', v.pay_type,
+            'useDefault', v.use_default,
+            'ratePerRai', v.eff_rate_per_rai,
+            'repairRate', v.eff_repair_rate,
+            'dailyRate', v.eff_daily_rate
+          )
+          ORDER BY v.username
+        ) AS assignees
+      FROM v_task_assignees_effective v
+      WHERE v.task_id = t.id
+    ) a ON TRUE
     WHERE t.id = ${id}
     LIMIT 1
   `;
@@ -244,12 +300,10 @@ router.patch("/:id", auth, async (c) => {
     `;
     if (!updated.length) return c.json({ error: "not_found" }, 404);
 
-    const assignees = await db/*sql*/`
-      ${assigneesJsonAgg.replaceAll("t.id", `${id}`)}
-    `;
+    const assignees = await fetchAssigneesJson(db, id);
     return c.json({
       message: "updated",
-      task: { ...updated[0], assignees: (assignees as any)[0]?.assignees ?? [] },
+      task: { ...updated[0], assignees },
     });
   }
 
@@ -314,12 +368,10 @@ router.patch("/:id", auth, async (c) => {
     }
   }
 
-  const assignees = await db/*sql*/`
-    ${assigneesJsonAgg.replaceAll("t.id", `${id}`)}
-  `;
+  const assignees = await fetchAssigneesJson(db, id);
   return c.json({
     message: "updated",
-    task: { ...updated[0], assignees: (assignees as any)[0]?.assignees ?? [] },
+    task: { ...updated[0], assignees },
   });
 });
 
