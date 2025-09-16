@@ -333,7 +333,6 @@ router.patch("/:id", auth, async (c) => {
         await db/*sql*/`
           INSERT INTO task_assignees (task_id, user_id, use_default)
           VALUES (${id}::int, ${u2.id}::int, true)
-          ON CONFLICT DO NOTHING
         `;
       }
     }
@@ -348,7 +347,9 @@ router.patch("/:id", auth, async (c) => {
   });
 });
 
-/** -------- POST /tasks/:id/payments (boss/admin) -------- */
+/** -------- PAYMENTS APIs (boss/admin) -------- */
+
+/** POST /tasks/:id/payments  -> เพิ่มการจ่ายเงินของงาน */
 router.post("/:id/payments", auth, requireRole(["boss", "admin"]), async (c) => {
   const db = getDb((c as any).env);
   const id = Number(c.req.param("id"));
@@ -360,16 +361,110 @@ router.post("/:id/payments", auth, requireRole(["boss", "admin"]), async (c) => 
     return c.json({ error: "amount invalid" }, 400);
   }
 
-  await db/*sql*/`
-    INSERT INTO task_payments (task_id, amount, note)
-    VALUES (${id}::int, ${amount}::int, ${note}::text)
-  `;
-  await db/*sql*/`
-    UPDATE tasks SET paid_amount = paid_amount + ${amount}::int
-    WHERE id = ${id}::int
-  `;
+  // งานต้องมีอยู่
+  const exists = await db/*sql*/`SELECT 1 FROM tasks WHERE id = ${id} LIMIT 1`;
+  if (!exists.length) return c.json({ error: "not_found" }, 404);
+
+  await db/*sql*/`BEGIN`;
+  try {
+    await db/*sql*/`
+      INSERT INTO task_payments (task_id, amount, note)
+      VALUES (${id}::int, ${amount}::int, ${note}::text)
+    `;
+    await db/*sql*/`
+      UPDATE tasks SET paid_amount = paid_amount + ${amount}::int
+      WHERE id = ${id}::int
+    `;
+    await db/*sql*/`COMMIT`;
+  } catch (e) {
+    await db/*sql*/`ROLLBACK`;
+    return c.json({ error: "payment_failed", detail: (e as any)?.message }, 500);
+  }
 
   return c.json({ message: "payment recorded" }, 201);
+});
+
+/** GET /tasks/:id/payments  -> ดูรายการจ่ายเงินของงาน */
+router.get("/:id/payments", auth, async (c) => {
+  const db = getDb((c as any).env);
+  const id = Number(c.req.param("id"));
+
+  const exists = await db/*sql*/`SELECT 1 FROM tasks WHERE id = ${id} LIMIT 1`;
+  if (!exists.length) return c.json({ error: "not_found" }, 404);
+
+  const rows = await db/*sql*/`
+    SELECT id, task_id, amount, note, created_at
+    FROM task_payments
+    WHERE task_id = ${id}
+    ORDER BY created_at DESC, id DESC
+  `;
+  return c.json(rows);
+});
+
+/** DELETE /tasks/:id/payments/:paymentId  -> ลบรายการจ่ายเงิน 1 รายการของงาน */
+router.delete("/:id/payments/:paymentId", auth, requireRole(["boss", "admin"]), async (c) => {
+  const db = getDb((c as any).env);
+  const id = Number(c.req.param("id"));
+  const pid = Number(c.req.param("paymentId"));
+  if (!Number.isInteger(pid) || pid <= 0) return c.json({ error: "invalid payment id" }, 400);
+
+  // หา payment + งานก่อน
+  const prow = await db<{ id: number; task_id: number; amount: number }>`
+    SELECT id, task_id, amount
+    FROM task_payments
+    WHERE id = ${pid} AND task_id = ${id}
+    LIMIT 1
+  `;
+  if (!prow.length) return c.json({ error: "not_found" }, 404);
+
+  await db/*sql*/`BEGIN`;
+  try {
+    await db/*sql*/`DELETE FROM task_payments WHERE id = ${pid}`;
+    await db/*sql*/`
+      UPDATE tasks SET paid_amount = GREATEST(0, paid_amount - ${prow[0].amount}::int)
+      WHERE id = ${id}
+    `;
+    await db/*sql*/`COMMIT`;
+  } catch (e) {
+    await db/*sql*/`ROLLBACK`;
+    return c.json({ error: "delete_payment_failed", detail: (e as any)?.message }, 500);
+  }
+
+  return c.json({ message: "payment_deleted", paymentId: pid });
+});
+
+/** -------- DELETE /tasks/:id (boss/admin) --------
+ * ลบเฉพาะข้อมูลที่เกี่ยวข้องกับงานนี้: payments, assignees แล้วค่อยลบ task
+ */
+router.delete("/:id", auth, requireRole(["boss", "admin"]), async (c) => {
+  const db = getDb((c as any).env);
+  const id = Number(c.req.param("id"));
+  if (!Number.isInteger(id) || id <= 0) {
+    return c.json({ error: "invalid id" }, 400);
+  }
+
+  // มีงานนี้จริงไหม
+  const exists = await db/*sql*/`SELECT 1 FROM tasks WHERE id = ${id} LIMIT 1`;
+  if (!exists.length) return c.json({ error: "not_found" }, 404);
+
+  await db/*sql*/`BEGIN`;
+  try {
+    // 1) ลบข้อมูลจ่ายเงินของงานนี้
+    await db/*sql*/`DELETE FROM task_payments WHERE task_id = ${id}`;
+
+    // 2) ลบผู้รับงานของงานนี้
+    await db/*sql*/`DELETE FROM task_assignees WHERE task_id = ${id}`;
+
+    // 3) ลบตัวงาน
+    await db/*sql*/`DELETE FROM tasks WHERE id = ${id}`;
+
+    await db/*sql*/`COMMIT`;
+  } catch (e) {
+    await db/*sql*/`ROLLBACK`;
+    return c.json({ error: "delete_failed", detail: (e as any)?.message }, 500);
+  }
+
+  return c.json({ message: "deleted", id });
 });
 
 export default router;
