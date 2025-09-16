@@ -1,4 +1,3 @@
-// src/schemas/task.ts
 import { z } from "zod";
 
 /** ===== Enums ===== */
@@ -19,6 +18,16 @@ const DateString = z
 
 const IntLike = z.coerce.number().int();
 const NumLike = z.coerce.number();
+
+// แปลง "" → undefined ก่อน validate
+const OptInt = z.preprocess(
+    (v) => (v === "" || v === null ? undefined : v),
+    z.number().int().nonnegative()
+);
+const OptNum = z.preprocess(
+    (v) => (v === "" || v === null ? undefined : v),
+    z.number().nonnegative()
+);
 
 /** ===== Assignee Config ===== */
 export const AssigneeConfigSchema = z
@@ -43,8 +52,9 @@ const CreateTaskBase = z
         startDate: DateString,
         endDate: DateString,
 
-        area: NumLike.nonnegative().optional(),
-        trucks: IntLike.nonnegative().optional(),
+        // ใช้ Opt* เพื่อให้ "" ไม่ทำให้เป็น 0
+        area: OptNum.optional(),
+        trucks: OptInt.optional(),
 
         totalAmount: IntLike.nonnegative(),
         paidAmount: IntLike.nonnegative().default(0),
@@ -86,6 +96,18 @@ export const CreateTaskSchema = CreateTaskBase.superRefine((data, ctx) => {
             path: ["paidAmount"],
         });
     }
+
+    // งานไร่ ต้องกรอกอย่างน้อย 1: area หรือ trucks
+    if (data.jobType === "งานไร่") {
+        if (data.area === undefined && data.trucks === undefined) {
+            ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                message: "งานไร่ ต้องกรอกอย่างน้อย 1 อย่าง: จำนวนไร่ หรือ จำนวนรถ",
+                path: ["area"],
+            });
+        }
+    }
+    // งานซ่อม → ไม่บังคับ area/trucks (ปล่อยว่างได้)
 });
 
 /** ===== Update (PATCH) ===== */
@@ -118,6 +140,17 @@ export const UpdateTaskSchema = CreateTaskBase.partial()
                 message: "paidAmount cannot exceed totalAmount",
                 path: ["paidAmount"],
             });
+        }
+
+        // สำหรับ PATCH: บังคับก็ต่อเมื่อผู้ใช้ส่ง jobType=งานไร่ มาด้วย
+        if (data.jobType === "งานไร่") {
+            if (data.area === undefined && data.trucks === undefined) {
+                ctx.addIssue({
+                    code: z.ZodIssueCode.custom,
+                    message: "งานไร่ ต้องกรอกอย่างน้อย 1 อย่าง: จำนวนไร่ หรือ จำนวนรถ",
+                    path: ["area"],
+                });
+            }
         }
     });
 

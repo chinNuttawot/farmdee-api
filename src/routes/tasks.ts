@@ -1,4 +1,3 @@
-// src/routes/tasks.ts
 import { Hono } from "hono";
 import { getDb } from "../db";
 import { auth } from "../middlewares/auth";
@@ -60,11 +59,7 @@ const assigneesJsonAgg = /*sql*/`
   WHERE v.task_id = t.id
 `;
 
-/** -------- GET /tasks --------
- * boss/admin: เห็นทั้งหมด
- * user: เห็นเฉพาะงานที่ตัวเองถูก assign
- * รองรับ query: ?from=YYYY-MM-DD&to=YYYY-MM-DD&status=...&jobType=...
- */
+/** -------- GET /tasks -------- */
 router.get("/", auth, async (c) => {
   const db = getDb((c as any).env);
   const u = c.get("user") as { id: number; role?: string };
@@ -81,9 +76,7 @@ router.get("/", auth, async (c) => {
         t.*,
         COALESCE(a.assignees, '[]'::json) AS assignees
       FROM tasks t
-      LEFT JOIN LATERAL (
-        ${assigneesJsonAgg}
-      ) a ON TRUE
+      LEFT JOIN LATERAL (${assigneesJsonAgg}) a ON TRUE
       WHERE
         (${fromParam}::date IS NULL OR t.start_date >= ${fromParam}::date)
         AND (${toParam}::date   IS NULL OR t.end_date   <= ${toParam}::date)
@@ -101,9 +94,7 @@ router.get("/", auth, async (c) => {
       JOIN task_assignees ta_v
         ON ta_v.task_id = t.id
        AND ta_v.user_id = ${u.id}
-      LEFT JOIN LATERAL (
-        ${assigneesJsonAgg}
-      ) a ON TRUE
+      LEFT JOIN LATERAL (${assigneesJsonAgg}) a ON TRUE
       WHERE
         (${fromParam}::date IS NULL OR t.start_date >= ${fromParam}::date)
         AND (${toParam}::date   IS NULL OR t.end_date   <= ${toParam}::date)
@@ -139,18 +130,14 @@ router.get("/:id", auth, async (c) => {
       t.*,
       COALESCE(a.assignees, '[]'::json) AS assignees
     FROM tasks t
-    LEFT JOIN LATERAL (
-      ${assigneesJsonAgg}
-    ) a ON TRUE
+    LEFT JOIN LATERAL (${assigneesJsonAgg}) a ON TRUE
     WHERE t.id = ${id}
     LIMIT 1
   `;
   return c.json(rows[0]);
 });
 
-/** -------- POST /tasks (boss/admin) --------
- * รองรับ assigneeConfigs: [{ userId|username, useDefault, ratePerRai, repairRate, dailyRate }]
- */
+/** -------- POST /tasks (boss/admin) -------- */
 router.post("/", auth, requireRole(["boss", "admin"]), async (c) => {
   const db = getDb((c as any).env);
   const creator = c.get("user") as { id: number };
@@ -172,8 +159,8 @@ router.post("/", auth, requireRole(["boss", "admin"]), async (c) => {
       ${d.endDate}::date,
       ${d.area ?? null}::numeric,
       ${d.trucks ?? null}::int,
-      ${d.totalAmount ?? 0}::int,   -- บันทึกเงินเฉพาะตอนสร้าง
-      ${d.paidAmount ?? 0}::int,  -- บันทึกเงินเฉพาะตอนสร้าง
+      ${d.totalAmount ?? 0}::int,
+      ${d.paidAmount ?? 0}::int,
       ${d.note ?? null}::text,
       ${d.status ?? 'รอทำ'}::text,
       ${d.color ?? null}::text,
@@ -185,11 +172,9 @@ router.post("/", auth, requireRole(["boss", "admin"]), async (c) => {
   `;
   const taskId = trow[0].id;
 
-  // 1) โหมดใหม่: assigneeConfigs
   if (Array.isArray(d.assigneeConfigs) && d.assigneeConfigs.length > 0) {
     await upsertAssignees(db, taskId, d.assigneeConfigs);
   } else {
-    // 2) โหมดเดิม: ids หรือ usernames (จะถือว่าใช้ default ทั้งหมด)
     if (Array.isArray(d.assigneeIds) && d.assigneeIds.length > 0) {
       for (const uid of d.assigneeIds) {
         await db/*sql*/`
@@ -215,10 +200,7 @@ router.post("/", auth, requireRole(["boss", "admin"]), async (c) => {
   return c.json({ message: "created", id: taskId }, 201);
 });
 
-/** -------- PATCH /tasks/:id --------
- * user: แก้ได้เฉพาะ progress, note
- * boss/admin: แก้ได้หลายฟิลด์ แต่ "ไม่ให้แก้เงิน" (total_amount/paid_amount)
- */
+/** -------- PATCH /tasks/:id -------- */
 router.patch("/:id", auth, async (c) => {
   const db = getDb((c as any).env);
   const u = c.get("user") as { id: number; role?: string };
@@ -230,7 +212,6 @@ router.patch("/:id", auth, async (c) => {
   if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400);
   const d: any = parsed.data;
 
-  // permission to see/update
   const can = isBossOrAdmin(u)
     ? await db`SELECT 1 FROM tasks WHERE id = ${id} LIMIT 1`
     : await db/*sql*/`
@@ -247,7 +228,6 @@ router.patch("/:id", auth, async (c) => {
   const admin = isBossOrAdmin(u);
 
   if (!admin) {
-    // ----- USER: progress/note เท่านั้น -----
     const progressVal = d.progress ?? null;
     const noteVal = d.note ?? undefined;
 
@@ -273,7 +253,6 @@ router.patch("/:id", auth, async (c) => {
     });
   }
 
-  // ----- ADMIN: ห้ามอัปเดตเงิน -----
   const titleVal = d.title ?? null;
   const jobTypeVal = d.jobType ?? null;
   const startDateVal = d.startDate ?? null;
@@ -309,13 +288,10 @@ router.patch("/:id", auth, async (c) => {
   `;
   if (!updated.length) return c.json({ error: "not_found" }, 404);
 
-  // อัปเดตผู้รับงานถ้าส่ง assigneeConfigs มา
   if (Array.isArray(d.assigneeConfigs)) {
-    // เลือกวิธีรีเฟรชทั้งชุดเพื่อให้ตรงกับ UI
     await db`DELETE FROM task_assignees WHERE task_id = ${id}`;
     await upsertAssignees(db, id, d.assigneeConfigs);
   } else if (Array.isArray(d.assigneeIds) || Array.isArray(d.assigneeUsernames)) {
-    // โหมดเดิม: ถือว่าใช้ default ทั้งหมด
     await db`DELETE FROM task_assignees WHERE task_id = ${id}`;
     if (Array.isArray(d.assigneeIds) && d.assigneeIds.length > 0) {
       for (const uid of d.assigneeIds) {
@@ -349,7 +325,6 @@ router.patch("/:id", auth, async (c) => {
 
 /** -------- PAYMENTS APIs (boss/admin) -------- */
 
-/** POST /tasks/:id/payments  -> เพิ่มการจ่ายเงินของงาน */
 router.post("/:id/payments", auth, requireRole(["boss", "admin"]), async (c) => {
   const db = getDb((c as any).env);
   const id = Number(c.req.param("id"));
@@ -361,7 +336,6 @@ router.post("/:id/payments", auth, requireRole(["boss", "admin"]), async (c) => 
     return c.json({ error: "amount invalid" }, 400);
   }
 
-  // งานต้องมีอยู่
   const exists = await db/*sql*/`SELECT 1 FROM tasks WHERE id = ${id} LIMIT 1`;
   if (!exists.length) return c.json({ error: "not_found" }, 404);
 
@@ -384,7 +358,6 @@ router.post("/:id/payments", auth, requireRole(["boss", "admin"]), async (c) => 
   return c.json({ message: "payment recorded" }, 201);
 });
 
-/** GET /tasks/:id/payments  -> ดูรายการจ่ายเงินของงาน */
 router.get("/:id/payments", auth, async (c) => {
   const db = getDb((c as any).env);
   const id = Number(c.req.param("id"));
@@ -401,14 +374,12 @@ router.get("/:id/payments", auth, async (c) => {
   return c.json(rows);
 });
 
-/** DELETE /tasks/:id/payments/:paymentId  -> ลบรายการจ่ายเงิน 1 รายการของงาน */
 router.delete("/:id/payments/:paymentId", auth, requireRole(["boss", "admin"]), async (c) => {
   const db = getDb((c as any).env);
   const id = Number(c.req.param("id"));
   const pid = Number(c.req.param("paymentId"));
   if (!Number.isInteger(pid) || pid <= 0) return c.json({ error: "invalid payment id" }, 400);
 
-  // หา payment + งานก่อน
   const prow = await db<{ id: number; task_id: number; amount: number }>`
     SELECT id, task_id, amount
     FROM task_payments
@@ -433,9 +404,7 @@ router.delete("/:id/payments/:paymentId", auth, requireRole(["boss", "admin"]), 
   return c.json({ message: "payment_deleted", paymentId: pid });
 });
 
-/** -------- DELETE /tasks/:id (boss/admin) --------
- * ลบเฉพาะข้อมูลที่เกี่ยวข้องกับงานนี้: payments, assignees แล้วค่อยลบ task
- */
+/** -------- DELETE /tasks/:id (boss/admin) -------- */
 router.delete("/:id", auth, requireRole(["boss", "admin"]), async (c) => {
   const db = getDb((c as any).env);
   const id = Number(c.req.param("id"));
@@ -443,21 +412,14 @@ router.delete("/:id", auth, requireRole(["boss", "admin"]), async (c) => {
     return c.json({ error: "invalid id" }, 400);
   }
 
-  // มีงานนี้จริงไหม
   const exists = await db/*sql*/`SELECT 1 FROM tasks WHERE id = ${id} LIMIT 1`;
   if (!exists.length) return c.json({ error: "not_found" }, 404);
 
   await db/*sql*/`BEGIN`;
   try {
-    // 1) ลบข้อมูลจ่ายเงินของงานนี้
     await db/*sql*/`DELETE FROM task_payments WHERE task_id = ${id}`;
-
-    // 2) ลบผู้รับงานของงานนี้
     await db/*sql*/`DELETE FROM task_assignees WHERE task_id = ${id}`;
-
-    // 3) ลบตัวงาน
     await db/*sql*/`DELETE FROM tasks WHERE id = ${id}`;
-
     await db/*sql*/`COMMIT`;
   } catch (e) {
     await db/*sql*/`ROLLBACK`;
