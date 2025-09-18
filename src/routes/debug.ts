@@ -1,33 +1,49 @@
 import { Hono } from "hono";
 import { getDb } from "../db";
+import { responseSuccess, responseError } from "../utils/responseHelper";
 
 const router = new Hono();
 
-// /__debug/env
+/** GET /__debug/env */
 router.get("/__debug/env", (c) => {
-    const hasNeon = Boolean((c as any).env?.NEON_DATABASE_URL);
-    const allow = (c as any).env?.CORS_ALLOW_ORIGIN ?? "(unset)";
-    const iter = (c as any).env?.PBKDF2_ITER ?? "(unset)";
-    return c.json({
-        NEON_DATABASE_URL: hasNeon ? "SET" : "MISSING",
-        CORS_ALLOW_ORIGIN: allow,
-        PBKDF2_ITER: iter,
-    });
-});
-
-// /__db/ping
-router.get("/__db/ping", async (c) => {
     try {
-        const db = getDb((c as any).env);
-        const rows = await db`SELECT 1 AS ok`;
-        return c.json({ ok: rows?.[0]?.ok === 1 });
+        const env = (c as any).env ?? {};
+        const hasNeon = Boolean(env.NEON_DATABASE_URL);
+        const allow = (env.CORS_ALLOW_ORIGIN as string | undefined) ?? "(unset)";
+        const iter = (env.PBKDF2_ITER as string | number | undefined) ?? "(unset)";
+
+        return responseSuccess(c, "env", {
+            NEON_DATABASE_URL: hasNeon ? "SET" : "MISSING",
+            CORS_ALLOW_ORIGIN: allow,
+            PBKDF2_ITER: iter,
+        });
     } catch (e: any) {
-        console.error("DB PING ERROR:", e);
-        return c.json({ error: e?.message ?? String(e) }, 500);
+        console.error("DEBUG ENV ERROR:", e);
+        return responseError(c, "internal", 500, e?.message ?? String(e));
     }
 });
 
-// /health
-router.get("/health", (c) => c.json({ ok: true, ts: new Date().toISOString() }));
+/** GET /__db/ping */
+router.get("/__db/ping", async (c) => {
+    const t0 = Date.now();
+    try {
+        const db = getDb((c as any).env);
+        const rows = await db<{ ok: number }>`SELECT 1 AS ok`;
+        const ok = rows?.[0]?.ok === 1;
+
+        return responseSuccess(c, "db ping", {
+            ok,
+            latencyMs: Date.now() - t0,
+        });
+    } catch (e: any) {
+        console.error("DB PING ERROR:", e);
+        return responseError(c, "internal", 500, e?.message ?? String(e));
+    }
+});
+
+/** GET /health */
+router.get("/health", (c) =>
+    responseSuccess(c, "healthy", { ts: new Date().toISOString() })
+);
 
 export default router;

@@ -2,7 +2,7 @@ import { z } from "zod";
 
 /** ===== Enums ===== */
 export const JobType = z.enum(["งานไร่", "งานซ่อม"]);
-export const StatusType = z.enum(["รอทำ", "กำลังทำ", "เสร็จ"]);
+export const StatusType = z.enum(["Pending", "InProgress", "Done"]);
 
 /** ===== Reusable Schemas ===== */
 const DateString = z
