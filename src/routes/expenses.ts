@@ -8,6 +8,12 @@ import { responseSuccess, responseError } from "../utils/responseHelper";
 const router = new Hono();
 
 /** ===== Zod Schemas ===== */
+// {
+//   "ค่าแรง": "labor",
+//   "ค่าอะไหล่": "material",
+//   "ค่าน้ำมัน": "fuel",
+//   "ค่าโหล่/ค่าขนส่ง": "transport"
+// }
 const CreateExpenseSchema = z.object({
     title: z.string().min(1),
     type: z.enum(["labor", "material", "fuel", "transport"]),

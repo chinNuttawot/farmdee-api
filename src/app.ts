@@ -8,6 +8,9 @@ import expensesRouter from "./routes/expenses";
 import tasksRouter from "./routes/tasks";
 import usersRouter from "./routes/users";
 import payrollsRouter from "./routes/payrolls";
+import reportSummaryRouter from "./routes/reports";
+import announcementsRouter from "./routes/announcements";
+import ruleRouter from "./routes/rule";
 import type { Bindings } from "./types";
 
 const app = new Hono<{ Bindings: Bindings }>();
@@ -37,6 +40,9 @@ app.route("/tasks", tasksRouter);
 app.route("/expenses", expensesRouter);
 app.route("/users", usersRouter);
 app.route("/payrolls", payrollsRouter);
+app.route("/reports", reportSummaryRouter);
+app.route("/announcements", announcementsRouter);
+app.route("/rule", ruleRouter);
 
 
 app.use("/images/*", serveStatic({ root: "./" }));
