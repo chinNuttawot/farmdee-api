@@ -1,10 +1,33 @@
 name = "farmdee-api"
 main = "src/index.ts"
 compatibility_date = "2024-09-10"
-
-[vars]
-CORS_ALLOW_ORIGIN = "*"
-PBKDF2_ITER = "100000"
+workers_dev = true
 
 [assets]
 directory = "public"
+
+# ---------- GLOBAL VARS ----------
+[vars]
+CORS_ALLOW_ORIGIN = "*"
+PBKDF2_ITER = "100000"
+ENV = "dev"
+
+# ---------- DEV ----------
+[env.dev]
+name = "farmdee-api-dev"
+workers_dev = true
+
+[env.dev.vars]
+ENV = "dev"
+CORS_ALLOW_ORIGIN = "*"
+PBKDF2_ITER = "100000"
+
+# ---------- PROD ----------
+[env.prod]
+name = "farmdee-api-prod"
+workers_dev = true
+
+[env.prod.vars]
+ENV = "prod"
+CORS_ALLOW_ORIGIN = "*"
+PBKDF2_ITER = "100000"
