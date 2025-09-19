@@ -4,12 +4,13 @@ import { serveStatic } from "hono/cloudflare-workers";
 import debugRouter from "./routes/debug";
 import authRouter from "./routes/auth";
 import meRouter from "./routes/me";
+import expensesRouter from "./routes/expenses";
 import tasksRouter from "./routes/tasks";
+import usersRouter from "./routes/users";
+import payrollsRouter from "./routes/payrolls";
 import type { Bindings } from "./types";
 
 const app = new Hono<{ Bindings: Bindings }>();
-
-// ============ Global error handlers ============
 app.onError((err, c) => {
     console.error("UNCAUGHT ERROR:", err);
     return c.json(
@@ -18,8 +19,6 @@ app.onError((err, c) => {
     );
 });
 app.notFound((c) => c.json({ error: "not_found" }, 404));
-
-// ============ CORS ============
 app.use(
     "*",
     cors({
@@ -31,14 +30,15 @@ app.use(
     })
 );
 
-// ============ Routes ============
-app.route("/", debugRouter);      // /__debug/*, /__db/ping, /health
-app.route("/auth", authRouter);   // /auth/*
-app.route("/me", meRouter);       // /me
-app.route("/tasks", tasksRouter);       // /me
+app.route("/", debugRouter);
+app.route("/auth", authRouter);
+app.route("/me", meRouter);
+app.route("/tasks", tasksRouter);
+app.route("/expenses", expensesRouter);
+app.route("/users", usersRouter);
+app.route("/payrolls", payrollsRouter);
 
 
-// Static assets (เช่น /images/xxx.png)
 app.use("/images/*", serveStatic({ root: "./" }));
 
 export default app;
