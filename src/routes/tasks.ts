@@ -116,7 +116,22 @@ router.get("/", auth, async (c) => {
     // ----- ดึงงาน (ทุก user เหมือนกัน) -----
     const rows = await db/*sql*/`
       SELECT
-        t.*,
+          t.id,
+          TRIM(TRAILING '.' FROM TRIM(TRAILING '0' FROM t.area::text))::numeric AS area,
+          t.title,
+          t.job_type,
+          t.start_date,
+          t.end_date,
+          t.trucks,
+          t.total_amount,
+          t.paid_amount,
+          t.note,
+          t.status,
+          t.color,
+          t.tags,
+          t.progress,
+          t.created_by,
+          t.created_at,
         COALESCE(a.assignees, '[]'::json) AS assignees
       FROM tasks t
       LEFT JOIN LATERAL (
