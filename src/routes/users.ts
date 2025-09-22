@@ -32,7 +32,8 @@ router.get("/", auth, async (c) => {
         pay_type, 
         default_rate_per_rai As rate_Per_Rai, 
         default_repair_rate As repair_Rate,
-        default_daily_rate As daily_Rate
+        default_daily_rate As daily_Rate,
+        full_name
       FROM users
       WHERE (${role}::text IS NULL OR role = ${role}::text)
       ORDER BY username ASC
