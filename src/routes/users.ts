@@ -20,7 +20,7 @@ router.get("/", auth, async (c) => {
         const db = getDb((c as any).env);
         const q = c.req.query();
         const role = q.role ?? null;
-        // ดึงรายชื่อพนักงานทั้งหมด
+        const username = q.username ?? null;
         const rows = await db/*sql*/`
       SELECT 
         id, 
@@ -28,14 +28,16 @@ router.get("/", auth, async (c) => {
         email, 
         role, 
         created_at, 
-        name_car As namecar, 
+        name_car AS namecar, 
         pay_type, 
-        default_rate_per_rai As rate_Per_Rai, 
-        default_repair_rate As repair_Rate,
-        default_daily_rate As daily_Rate,
+        default_rate_per_rai AS rate_per_rai, 
+        default_repair_rate AS repair_rate,
+        default_daily_rate AS daily_rate,
         full_name
       FROM users
-      WHERE (${role}::text IS NULL OR role = ${role}::text)
+      WHERE 
+        (${role}::text IS NULL OR role = ${role}::text)
+        AND (${username}::text IS NULL OR username ILIKE '%' || ${username} || '%')
       ORDER BY username ASC
     `;
 
