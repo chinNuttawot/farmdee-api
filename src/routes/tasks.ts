@@ -492,23 +492,29 @@ router.patch("/:id", auth, async (c) => {
     const progressVal = d.progress ?? null;
     const noteVal = d.note ?? undefined;
 
+    // ⭐️ เพิ่มสองฟิลด์นี้
+    const totalAmountVal = d.totalAmount ?? null;
+    const paidAmountVal = d.paidAmount ?? null;
+
     const updated = await db/*sql*/`
       UPDATE tasks SET
-        title        = COALESCE(${titleVal}::text,        title),
-        job_type     = COALESCE(${jobTypeVal}::text,      job_type),
-        start_date   = COALESCE(${startDateVal}::date,    start_date),
-        end_date     = COALESCE(${endDateVal}::date,      end_date),
-        area         = COALESCE(${areaVal}::numeric,      area),
-        trucks       = COALESCE(${trucksVal}::int,        trucks),
-        status       = COALESCE(${statusVal}::text,       status),
-        color        = COALESCE(${colorVal}::text,        color),
-        tags         = COALESCE(${tagsVal}::text[],       tags),
-        progress     = CASE
-                         WHEN (${progressVal}::numeric(3,1)) IS NULL THEN progress
-                         ELSE GREATEST(0.0::numeric(3,1),
-                                       LEAST(1.0::numeric(3,1), (${progressVal})::numeric(3,1)))
-                       END,
-        note         = COALESCE(${noteVal}::text,         note)
+        title         = COALESCE(${titleVal}::text,            title),
+        job_type      = COALESCE(${jobTypeVal}::text,          job_type),
+        start_date    = COALESCE(${startDateVal}::date,        start_date),
+        end_date      = COALESCE(${endDateVal}::date,          end_date),
+        area          = COALESCE(${areaVal}::numeric,          area),
+        trucks        = COALESCE(${trucksVal}::int,            trucks),
+        status        = COALESCE(${statusVal}::text,           status),
+        color         = COALESCE(${colorVal}::text,            color),
+        tags          = COALESCE(${tagsVal}::text[],           tags),
+        total_amount  = COALESCE(${totalAmountVal}::numeric,   total_amount),
+        paid_amount   = COALESCE(${paidAmountVal}::numeric,    paid_amount),
+        progress      = CASE
+                          WHEN (${progressVal}::numeric(3,1)) IS NULL THEN progress
+                          ELSE GREATEST(0.0::numeric(3,1),
+                                        LEAST(1.0::numeric(3,1), (${progressVal})::numeric(3,1)))
+                        END,
+        note          = COALESCE(${noteVal}::text,             note)
       WHERE id = ${id}
       RETURNING *
     `;
