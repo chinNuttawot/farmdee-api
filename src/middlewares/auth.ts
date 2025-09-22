@@ -20,15 +20,20 @@ export async function auth(c: Context, next: Next) {
         if (!token) {
             return c.json({ error: "missing token" }, 401);
         }
-        // optional: กัน token แปลกๆ
         if (token.length < 16 || token.length > 2048) {
             return c.json({ error: "invalid token" }, 401);
         }
 
-        // ดึง user ที่สัมพันธ์กับ session ที่ยัง valid ใน SQL เลย
-        // หมายเหตุ: ถ้าใช้ Postgres และคอลัมน์ expires_at เป็น timestamptz จะเทียบกับ NOW() ได้ตรงเวลา
-        const rows = await db<Pick<SlimUser, "id" | "username" | "email" | "role" | "created_at">>`
-      SELECT u.id, u.username, u.email, u.role, u.created_at
+        const rows = await db<
+            Pick<SlimUser, "id" | "username" | "email" | "role" | "created_at" | "full_name">
+        >/*sql*/`
+      SELECT 
+        u.id, 
+        u.username, 
+        u.email, 
+        u.role, 
+        u.created_at,
+        u.full_name
       FROM sessions s
       JOIN users u ON u.id = s.user_id
       WHERE s.token = ${token}
@@ -38,13 +43,11 @@ export async function auth(c: Context, next: Next) {
     `;
 
         if (rows.length === 0) {
-            // (อาจ) แยกสาเหตุแบบละเอียด ต้อง query เพิ่มเติม แต่โดยทั่วไปพอแล้ว
             return c.json({ error: "invalid or expired token" }, 401);
         }
 
         const user = rows[0];
-        c.set("user", user); // { id, username, email, role, created_at }
-        // ถ้าต้องการ set session id/อันอื่น เพิ่ม SELECT column ในด้านบนแล้ว c.set("sessionId", ...)
+        c.set("user", user); // มี full_name แล้ว
 
         await next();
     } catch (e: any) {
