@@ -37,7 +37,7 @@ router.get("/", auth, async (c) => {
       FROM users
       WHERE 
         (${role}::text IS NULL OR role = ${role}::text)
-        AND (${username}::text IS NULL OR username ILIKE '%' || ${username} || '%')
+        AND (${username}::text IS NULL OR username = ${username}::text)
       ORDER BY username ASC
     `;
 
