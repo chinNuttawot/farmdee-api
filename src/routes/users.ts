@@ -22,7 +22,17 @@ router.get("/", auth, async (c) => {
         const role = q.role ?? null;
         // ดึงรายชื่อพนักงานทั้งหมด
         const rows = await db/*sql*/`
-      SELECT id, username, email, role, created_at, name_car As namecar
+      SELECT 
+        id, 
+        username, 
+        email, 
+        role, 
+        created_at, 
+        name_car As namecar, 
+        pay_type, 
+        default_rate_per_rai As rate_Per_Rai, 
+        default_repair_rate As repair_Rate,
+        default_daily_rate As daily_Rate
       FROM users
       WHERE (${role}::text IS NULL OR role = ${role}::text)
       ORDER BY username ASC

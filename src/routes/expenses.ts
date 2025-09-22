@@ -45,7 +45,7 @@ router.get("/", auth, async (c) => {
       WHERE
         (${from}::date IS NULL OR e.work_date = ${from}::date)
         AND (${type}::text IS NULL OR e.type = ${type}::text)
-      ORDER BY e.work_date DESC, e.id DESC
+      ORDER BY e.created_at ASC
     `;
 
         return responseSuccess(c, "fetched expenses", {

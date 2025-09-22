@@ -1,9 +1,20 @@
+// routes/tasks.ts
 import { Hono } from "hono";
 import { getDb } from "../db";
 import { auth } from "../middlewares/auth";
 import { requireRole, isBossOrAdmin } from "../middlewares/role";
 import { CreateTaskSchema, UpdateTaskSchema } from "../schemas/task";
 import { responseSuccess, responseError } from "../utils/responseHelper";
+// helpers
+function normalizeToStringArrayForGet(v: unknown): string[] {
+  if (Array.isArray(v)) return v.map(String).map(s => s.trim()).filter(Boolean);
+  if (typeof v === "string") return v.split("|").map(s => s.trim()).filter(Boolean);
+  return [];
+}
+function escapeLike(s: string) {
+  // หนี % และ _ รวมถึง \ ให้ปลอดภัยกับ LIKE
+  return s.replace(/[\\%_]/g, "\\$&");
+}
 
 const router = new Hono();
 
@@ -28,33 +39,118 @@ function normalizeStatusBody(val: unknown): "Pending" | "InProgress" | "Done" {
 }
 
 /** -------- helpers -------- */
-async function upsertAssignees(db: any, taskId: number, list: any[]) {
+
+/** แปลงค่าที่มาจาก query ให้เป็น string[] เสมอ (รองรับ "a|b|c" หรือ array ของสตริง) */
+function normalizeToStringArray(v: unknown): string[] {
+  if (Array.isArray(v)) {
+    return v.map(String).map((s) => s.trim()).filter(Boolean);
+  }
+  if (typeof v === "string") {
+    return v
+      .split("|")
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+  return [];
+}
+
+/**
+ * upsertAssignees:
+ * - useDefault=true  -> ดึง default rates จาก users แล้วใส่ task_assignees (batch)
+ * - useDefault=false -> ใช้เรทที่ส่งมา (ratePerRai/repairRate/dailyRate)
+ * - รองรับทั้ง userId และ username (จะ resolve เป็น id ให้)
+ * NOTE: ตาราง task_assignees ไม่มีคอลัมน์ pay_type
+ */
+async function upsertAssignees(
+  db: any,
+  taskId: number,
+  list: Array<{
+    userId?: number;
+    username?: string;
+    useDefault?: boolean;
+    ratePerRai?: number | null;
+    repairRate?: number | null;
+    dailyRate?: number | null;
+  }>
+) {
+  if (!Array.isArray(list) || list.length === 0) return;
+
+  // resolve usernames -> ids (ครั้งเดียว)
+  const needNames = Array.from(
+    new Set(list.filter((a) => !a.userId && a.username).map((a) => a.username as string))
+  );
+  const nameToId = new Map<string, number>();
+  if (needNames.length > 0) {
+    const rows = await db<{ id: number; username: string }>`
+      SELECT id, username
+      FROM users
+      WHERE username = ANY(${needNames}::text[])
+    `;
+    for (const r of rows) nameToId.set(r.username, r.id);
+  }
+
+  const defaults: number[] = [];
+  const explicits: Array<{
+    userId: number;
+    ratePerRai?: number | null;
+    repairRate?: number | null;
+    dailyRate?: number | null;
+  }> = [];
+
   for (const cfg of list) {
-    // หาตาม id หรือ username
-    let uid = cfg.userId as number | undefined;
-    if (!uid && cfg.username) {
-      const urow = await db<{ id: number }>`
-        SELECT id FROM users WHERE username = ${cfg.username}::text LIMIT 1
-      `;
-      uid = urow[0]?.id;
-    }
+    const uid = cfg.userId ?? (cfg.username ? nameToId.get(cfg.username) : undefined);
     if (!uid) continue;
 
-    // ถ้า useDefault === true -> null ค่า custom ทั้งหมด
     const useDefault = cfg.useDefault !== false; // default = true
-    const ratePerRai = useDefault ? null : cfg.ratePerRai ?? null;
-    const repairRate = useDefault ? null : cfg.repairRate ?? null;
-    const dailyRate = useDefault ? null : cfg.dailyRate ?? null;
+    if (useDefault) {
+      defaults.push(uid);
+    } else {
+      explicits.push({
+        userId: uid,
+        ratePerRai: cfg.ratePerRai ?? null,
+        repairRate: cfg.repairRate ?? null,
+        dailyRate: cfg.dailyRate ?? null,
+      });
+    }
+  }
 
+  // use_default = true -> INSERT ... SELECT from users (batch)
+  if (defaults.length > 0) {
     await db/*sql*/`
       INSERT INTO task_assignees (
-        task_id, user_id, use_default,
-        rate_per_rai, repair_rate, daily_rate
-      ) VALUES (
-        ${taskId}::int, ${uid}::int, ${useDefault}::boolean,
-        ${ratePerRai}::numeric, ${repairRate}::numeric, ${dailyRate}::numeric
+        task_id, user_id, use_default, rate_per_rai, repair_rate, daily_rate
       )
-      ON CONFLICT (task_id, user_id) DO UPDATE SET
+      SELECT
+        ${taskId}::int,
+        u.id,
+        TRUE,
+        u.default_rate_per_rai,
+        u.default_repair_rate,
+        u.default_daily_rate
+      FROM users u
+      WHERE u.id = ANY(${defaults}::int[])
+      ON CONFLICT (task_id, user_id)
+      DO UPDATE SET
+        use_default  = EXCLUDED.use_default,
+        rate_per_rai = EXCLUDED.rate_per_rai,
+        repair_rate  = EXCLUDED.repair_rate,
+        daily_rate   = EXCLUDED.daily_rate
+    `;
+  }
+
+  // use_default = false -> ใช้ค่า explicit (ไม่ยุ่ง pay_type)
+  for (const a of explicits) {
+    await db/*sql*/`
+      INSERT INTO task_assignees (
+        task_id, user_id, use_default, rate_per_rai, repair_rate, daily_rate
+      ) VALUES (
+        ${taskId}::int, ${a.userId}::int, FALSE,
+        ${a.ratePerRai ?? null}::numeric,
+        ${a.repairRate ?? null}::numeric,
+        ${a.dailyRate ?? null}::numeric
+      )
+      ON CONFLICT (task_id, user_id)
+      DO UPDATE SET
         use_default  = EXCLUDED.use_default,
         rate_per_rai = EXCLUDED.rate_per_rai,
         repair_rate  = EXCLUDED.repair_rate,
@@ -72,7 +168,7 @@ async function fetchAssigneesJson(db: any, taskId: number) {
           json_build_object(
             'id', v.user_id,
             'username', v.username,
-            'payType', v.pay_type,
+            'payType', v.pay_type,               -- มาจาก VIEW
             'useDefault', v.use_default,
             'ratePerRai', v.eff_rate_per_rai,
             'repairRate', v.eff_repair_rate,
@@ -96,7 +192,12 @@ router.get("/", auth, async (c) => {
 
     // ----- รับพารามิเตอร์ -----
     const fromParam = q.from ?? null; // YYYY-MM-DD -> t.start_date = from
-    const toParam = q.to ?? null; // YYYY-MM-DD -> t.end_date = to
+    const toParam = q.to ?? null;     // YYYY-MM-DD -> t.end_date = to
+
+
+    const titleArr = normalizeToStringArrayForGet(q.title);
+    const titlePatterns = titleArr.map(s => `%${escapeLike(s)}%`);
+    const hasTitlePatterns = titlePatterns.length > 0;
 
     // รองรับหลายสถานะ: ?status=Pending|InProgress|Done  และ All/ว่าง = ไม่กรอง
     let statusArr: string[] = [];
@@ -113,9 +214,8 @@ router.get("/", auth, async (c) => {
       return responseError(c, "invalid_status", 400, (e as Error).message);
     }
 
-    // ----- ดึงงาน (ทุก user เหมือนกัน) -----
     const rows = await db/*sql*/`
-      SELECT
+        SELECT
           t.id,
           TRIM(TRAILING '.' FROM TRIM(TRAILING '0' FROM t.area::text))::numeric AS area,
           t.title,
@@ -132,11 +232,10 @@ router.get("/", auth, async (c) => {
           t.progress,
           t.created_by,
           t.created_at,
-        COALESCE(a.assignees, '[]'::json) AS assignees
-      FROM tasks t
-      LEFT JOIN LATERAL (
-        SELECT
-          json_agg(
+          COALESCE(a.assignees, '[]'::json) AS assignees
+        FROM tasks t
+        LEFT JOIN LATERAL (
+          SELECT json_agg(
             json_build_object(
               'id', v.user_id,
               'username', v.username,
@@ -145,21 +244,26 @@ router.get("/", auth, async (c) => {
               'ratePerRai', v.eff_rate_per_rai,
               'repairRate', v.eff_repair_rate,
               'dailyRate', v.eff_daily_rate
-            )
-            ORDER BY v.username
+            ) ORDER BY v.username
           ) AS assignees
-        FROM v_task_assignees_effective v
-        WHERE v.task_id = t.id
-      ) a ON TRUE
-      WHERE
-        ( ${fromParam}::date   IS NULL OR t.start_date = ${fromParam}::date )
-        AND ( ${toParam}::date IS NULL OR t.end_date   = ${toParam}::date )
-        AND ( ${hasStatus}::boolean IS FALSE OR t.status = ANY(${statusArr}::text[]) )
-      ORDER BY t.start_date ASC, t.id ASC
-    `;
+          FROM v_task_assignees_effective v
+          WHERE v.task_id = t.id
+        ) a ON TRUE
+        WHERE
+          ( ${fromParam}::date   IS NULL OR t.start_date = ${fromParam}::date )
+          AND ( ${toParam}::date IS NULL OR t.end_date   = ${toParam}::date )
+          AND ( ${hasStatus}::boolean IS FALSE OR t.status = ANY(${statusArr}::text[]) )
+          AND ( ${hasTitlePatterns}::boolean IS FALSE OR t.title ILIKE ANY(${titlePatterns}::text[]) )
+        ORDER BY t.created_at DESC, t.id DESC
+      `;
 
     return responseSuccess(c, "tasks", {
-      filters: { from: fromParam ?? null, to: toParam ?? null, status: hasStatus ? statusArr : [] },
+      filters: {
+        from: fromParam ?? null,
+        to: toParam ?? null,
+        status: hasStatus ? statusArr : [],
+        title: hasTitlePatterns ? titleArr : [],
+      },
       count: rows.length,
       items: rows,
     });
@@ -225,7 +329,7 @@ router.post("/", auth, requireRole(["boss", "admin"]), async (c) => {
     if (!parsed.success) return responseError(c, parsed.error.flatten(), 400);
     const d: any = parsed.data;
 
-    // status: ถ้าไม่ส่งมา -> Default 'Pending', ถ้าส่งมา validate ให้รับเฉพาะ 3 ค่า
+    // status default/validate
     let bodyStatus = "Pending";
     try {
       bodyStatus = d.status == null ? "Pending" : normalizeStatusBody(d.status);
@@ -233,6 +337,7 @@ router.post("/", auth, requireRole(["boss", "admin"]), async (c) => {
       return responseError(c, "invalid_status", 400, (e as Error).message);
     }
 
+    // insert task
     const trow = await db<{ id: number }>`
       INSERT INTO tasks (
         title, job_type, start_date, end_date, area, trucks,
@@ -257,29 +362,53 @@ router.post("/", auth, requireRole(["boss", "admin"]), async (c) => {
     `;
     const taskId = trow[0].id;
 
+    // ----- Assignees -----
     if (Array.isArray(d.assigneeConfigs) && d.assigneeConfigs.length > 0) {
       await upsertAssignees(db, taskId, d.assigneeConfigs);
-    } else {
-      if (Array.isArray(d.assigneeIds) && d.assigneeIds.length > 0) {
-        for (const uid of d.assigneeIds) {
-          await db/*sql*/`
-            INSERT INTO task_assignees (task_id, user_id, use_default)
-            VALUES (${taskId}::int, ${uid}::int, true)
-            ON CONFLICT DO NOTHING
-          `;
-        }
-      } else if (Array.isArray(d.assigneeUsernames) && d.assigneeUsernames.length > 0) {
-        const urows = await db<{ id: number }>`
-          SELECT id FROM users WHERE username = ANY(${d.assigneeUsernames}::text[])
-        `;
-        for (const u2 of urows) {
-          await db/*sql*/`
-            INSERT INTO task_assignees (task_id, user_id, use_default)
-            VALUES (${taskId}::int, ${u2.id}::int, true)
-            ON CONFLICT DO NOTHING
-          `;
-        }
-      }
+    } else if (Array.isArray(d.assigneeIds) && d.assigneeIds.length > 0) {
+      // ใช้ defaults จาก users (batch) — ไม่มี pay_type
+      await db/*sql*/`
+        INSERT INTO task_assignees (
+          task_id, user_id, use_default, rate_per_rai, repair_rate, daily_rate
+        )
+        SELECT
+          ${taskId}::int,
+          u.id,
+          TRUE,
+          u.default_rate_per_rai,
+          u.default_repair_rate,
+          u.default_daily_rate
+        FROM users u
+        WHERE u.id = ANY(${d.assigneeIds}::int[])
+        ON CONFLICT (task_id, user_id)
+        DO UPDATE SET
+          use_default  = EXCLUDED.use_default,
+          rate_per_rai = EXCLUDED.rate_per_rai,
+          repair_rate  = EXCLUDED.repair_rate,
+          daily_rate   = EXCLUDED.daily_rate
+      `;
+    } else if (Array.isArray(d.assigneeUsernames) && d.assigneeUsernames.length > 0) {
+      // ใช้ defaults จาก users (batch) ด้วย usernames — ไม่มี pay_type
+      await db/*sql*/`
+        INSERT INTO task_assignees (
+          task_id, user_id, use_default, rate_per_rai, repair_rate, daily_rate
+        )
+        SELECT
+          ${taskId}::int,
+          u.id,
+          TRUE,
+          u.default_rate_per_rai,
+          u.default_repair_rate,
+          u.default_daily_rate
+        FROM users u
+        WHERE u.username = ANY(${d.assigneeUsernames}::text[])
+        ON CONFLICT (task_id, user_id)
+        DO UPDATE SET
+          use_default  = EXCLUDED.use_default,
+          rate_per_rai = EXCLUDED.rate_per_rai,
+          repair_rate  = EXCLUDED.repair_rate,
+          daily_rate   = EXCLUDED.daily_rate
+      `;
     }
 
     return responseSuccess(c, "created", { id: taskId }, 201);
@@ -385,29 +514,56 @@ router.patch("/:id", auth, async (c) => {
     `;
     if (!updated.length) return responseError(c, "not_found", 404);
 
+    // ----- อัปเดตผู้รับงาน -----
     if (Array.isArray(d.assigneeConfigs)) {
       await db`DELETE FROM task_assignees WHERE task_id = ${id}`;
       await upsertAssignees(db, id, d.assigneeConfigs);
     } else if (Array.isArray(d.assigneeIds) || Array.isArray(d.assigneeUsernames)) {
       await db`DELETE FROM task_assignees WHERE task_id = ${id}`;
       if (Array.isArray(d.assigneeIds) && d.assigneeIds.length > 0) {
-        for (const uid of d.assigneeIds) {
-          await db/*sql*/`
-            INSERT INTO task_assignees (task_id, user_id, use_default)
-            VALUES (${id}::int, ${uid}::int, true)
-            ON CONFLICT DO NOTHING
-          `;
-        }
-      } else if (Array.isArray(d.assigneeUsernames) && d.assigneeUsernames.length > 0) {
-        const urows = await db<{ id: number }>`
-          SELECT id FROM users WHERE username = ANY(${d.assigneeUsernames}::text[])
+        // defaults จาก users (batch) — ไม่มี pay_type
+        await db/*sql*/`
+          INSERT INTO task_assignees (
+            task_id, user_id, use_default, rate_per_rai, repair_rate, daily_rate
+          )
+          SELECT
+            ${id}::int,
+            u.id,
+            TRUE,
+            u.default_rate_per_rai,
+            u.default_repair_rate,
+            u.default_daily_rate
+          FROM users u
+          WHERE u.id = ANY(${d.assigneeIds}::int[])
+          ON CONFLICT (task_id, user_id)
+          DO UPDATE SET
+            use_default  = EXCLUDED.use_default,
+            rate_per_rai = EXCLUDED.rate_per_rai,
+            repair_rate  = EXCLUDED.repair_rate,
+            daily_rate   = EXCLUDED.daily_rate
         `;
-        for (const u2 of urows) {
-          await db/*sql*/`
-            INSERT INTO task_assignees (task_id, user_id, use_default)
-            VALUES (${id}::int, ${u2.id}::int, true)
-          `;
-        }
+      } else if (Array.isArray(d.assigneeUsernames) && d.assigneeUsernames.length > 0) {
+        // defaults จาก users (batch) ด้วย usernames — ไม่มี pay_type
+        await db/*sql*/`
+          INSERT INTO task_assignees (
+            task_id, user_id, use_default, rate_per_rai, repair_rate, daily_rate
+          )
+          SELECT
+            ${id}::int,
+            u.id,
+            TRUE,
+            u.default_rate_per_rai,
+            u.default_repair_rate,
+            u.default_daily_rate
+          FROM users u
+          WHERE u.username = ANY(${d.assigneeUsernames}::text[])
+          ON CONFLICT (task_id, user_id)
+          DO UPDATE SET
+            use_default  = EXCLUDED.use_default,
+            rate_per_rai = EXCLUDED.rate_per_rai,
+            repair_rate  = EXCLUDED.repair_rate,
+            daily_rate   = EXCLUDED.daily_rate
+        `;
       }
     }
 
@@ -442,7 +598,7 @@ router.post("/:id/payments", auth, requireRole(["boss", "admin"]), async (c) => 
         VALUES (${id}::int, ${amount}::int, ${note}::text)
       `;
       await db/*sql*/`
-        UPDATE tasks SET paid_amount = paid_amount + ${amount}::int
+        UPDATE tasks SET paid_amount = GREATEST(0, paid_amount + ${amount}::int)
         WHERE id = ${id}::int
       `;
       await db/*sql*/`COMMIT`;
