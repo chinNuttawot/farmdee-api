@@ -25,7 +25,7 @@ router.post("/register", async (c) => {
         if (!parsed.success) {
             return responseError(c, parsed.error.flatten(), 400);
         }
-        const { username, password, email } = parsed.data;
+        const { username, password, email, fullName } = parsed.data;
 
         const exists = await db`SELECT id FROM users WHERE username = ${username}`;
         if (exists.length > 0) {
@@ -34,8 +34,8 @@ router.post("/register", async (c) => {
 
         const pw = await hashPassword(password);
         const rows = await db<{ id: number }>`
-      INSERT INTO users (username, password_hash, email)
-      VALUES (${username}, ${pw}, ${email ?? null})
+      INSERT INTO users (username, password_hash, email, full_name)
+      VALUES (${username}, ${pw}, ${email ?? null}, ${fullName})
       RETURNING id
     `;
 
