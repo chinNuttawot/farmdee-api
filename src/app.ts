@@ -1,4 +1,3 @@
-// src/index.ts
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { serveStatic } from "hono/cloudflare-workers";
@@ -13,22 +12,30 @@ import reportSummaryRouter from "./routes/reports";
 import announcementsRouter from "./routes/announcements";
 import ruleRouter from "./routes/rule";
 import type { Bindings } from "./types";
+import cron from "node-cron";
+import { Pool } from "pg";
+
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+});
 
 const app = new Hono<{ Bindings: Bindings }>();
 
 app.onError((err, c) => {
     console.error("UNCAUGHT ERROR:", err);
-    return c.json({ error: "internal_error", detail: (err as any)?.message ?? String(err) }, 500);
+    return c.json(
+        { error: "internal_error", detail: (err as any)?.message ?? String(err) },
+        500
+    );
 });
 
 app.notFound((c) => c.json({ error: "not_found" }, 404));
 
-// ✅ CORS สำหรับทุก origin (หรือกำหนดผ่าน ENV)
 app.use(
     "*",
     cors({
         origin: (origin, c) => (c as any).env?.CORS_ALLOW_ORIGIN || origin || "*",
-        credentials: false, // ถ้าจะส่งคุกกี้ตั้งเป็น true แล้วระบุ origin ให้ชัดเจน
+        credentials: false,
         allowHeaders: ["Content-Type", "Authorization"],
         allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         exposeHeaders: ["Content-Length", "Content-Type"],
@@ -51,10 +58,32 @@ app.route("/reports", reportSummaryRouter);
 app.route("/announcements", announcementsRouter);
 app.route("/rule", ruleRouter);
 
-// ✅ static (ภาพ/ไฟล์)
 app.use("/images/*", serveStatic({ root: "./" }));
 
-// ✅ กันเคสที่ client ยิง OPTIONS มาที่ปลายทางที่ไม่มีเมธอด OPTIONS
 app.options("*", (c) => c.body(null, 204));
+
+/* ==========================================================
+   🕒 CRON JOB: ทุกวันเวลา 00:01
+   ========================================================== */
+cron.schedule("1 0 * * *", async () => {
+    const client = await pool.connect();
+    try {
+        await client.query(`
+            UPDATE tasks
+            SET status = 'Done'
+            WHERE end_date < CURRENT_DATE
+                AND status != 'Done'
+        `);
+        await client.query(`
+            UPDATE tasks
+            SET status = 'InProgress'
+            WHERE start_date = CURRENT_DATE
+                AND status != 'InProgress'
+            `);
+    } catch (err) {
+    } finally {
+        client.release();
+    }
+});
 
 export default app;
