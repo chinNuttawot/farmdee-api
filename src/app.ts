@@ -1,3 +1,4 @@
+// src/index.ts
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { serveStatic } from "hono/cloudflare-workers";
@@ -63,27 +64,47 @@ app.use("/images/*", serveStatic({ root: "./" }));
 app.options("*", (c) => c.body(null, 204));
 
 /* ==========================================================
-   🕒 CRON JOB: ทุกวันเวลา 00:01
+   🕒 CRON JOB: ทุกวันเวลา 00:01 (โซนเวลาไทย)
+   กติกา:
+   - วันนี้ > end_date  → status = Done, color = #2E7D32
+   - วันนี้ = start_date → status = InProgress, color = #2962FF
    ========================================================== */
-cron.schedule("1 0 * * *", async () => {
-    const client = await pool.connect();
-    try {
-        await client.query(`
-            UPDATE tasks
-            SET status = 'Done'
-            WHERE end_date < CURRENT_DATE
-                AND status != 'Done'
-        `);
-        await client.query(`
-            UPDATE tasks
-            SET status = 'InProgress'
-            WHERE start_date = CURRENT_DATE
-                AND status != 'InProgress'
-            `);
-    } catch (err) {
-    } finally {
-        client.release();
-    }
-});
+cron.schedule(
+    "1 0 * * *",
+    async () => {
+        const client = await pool.connect();
+        try {
+            await client.query("BEGIN");
+            await client.query(
+                `
+                    UPDATE tasks
+                    SET status = 'Done',
+                        color  = '#2E7D32'
+                    WHERE end_date < CURRENT_DATE
+                    AND status <> 'Done'
+                `
+            );
+            await client.query(
+                `
+                    UPDATE tasks
+                    SET status = 'InProgress',
+                        color  = '#2962FF'
+                    WHERE start_date = CURRENT_DATE
+                    AND status NOT IN ('InProgress', 'Done')
+                `
+            );
+            await client.query("COMMIT");
+        } catch (err) {
+            await (async () => {
+                try {
+                    await pool.query("ROLLBACK");
+                } catch { }
+            })();
+        } finally {
+            client.release();
+        }
+    },
+    { timezone: "Asia/Bangkok" }
+);
 
 export default app;
