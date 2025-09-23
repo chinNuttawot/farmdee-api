@@ -26,29 +26,47 @@ const ListQuerySchema = z.object({
     status: z.enum(["Paid", "Unpaid"]).optional(),
 });
 
-/** ===== คำนวณจาก tasks + task_assignees (ไม่สร้างตารางใหม่) ===== */
+/** ===== คำนวณจาก tasks + task_assignees (ไม่สร้างตารางใหม่) =====
+ * กติกา:
+ * 1) ถ้าพนักงานเป็น Daily → ใช้ daily_rate ของงานนั้น ๆ
+ * 2) มิฉะนั้น ให้ดู jobType:
+ *    - "งานไร่"  → ใช้ area * rate_per_rai
+ *    - "งานซ่อม" → ใช้ repair_rate (คิดเป็นงานละ 1)
+ * เงื่อนไขเลือกงาน:
+ * - start_date ต้องอยู่ในเดือน
+ * - end_date ถ้าไม่ NULL ต้องอยู่ในเดือนด้วย
+ */
 async function computeFromDb(db: any, userId: number, month: string) {
-    // รายการรายละเอียด (แสดงในกล่อง "รายละเอียด" ของ UI)
     const details = await db/*sql*/`
+    WITH month_bounds AS (
+      SELECT
+        to_date(${month} || '-01', 'YYYY-MM-DD') AS d0,
+        (to_date(${month} || '-01', 'YYYY-MM-DD') + INTERVAL '1 month')::date AS d1
+    )
     SELECT
-      t.id           AS task_id,
+      t.id                       AS task_id,
       t.title,
-      t.job_type,
+      t.job_type,                -- "งานไร่" | "งานซ่อม"
       t.start_date,
       t.end_date,
-      t.area::numeric             AS area,
-      ta.rate_per_rai::numeric    AS rate_per_rai,
-      ta.repair_rate::numeric     AS repair_rate,
-      ta.daily_rate::numeric      AS daily_rate
+      t.area::numeric            AS area,
+      ta.rate_per_rai::numeric   AS rate_per_rai,
+      ta.repair_rate::numeric    AS repair_rate,
+      ta.daily_rate::numeric     AS daily_rate,
+      u.pay_type::text           AS worker_pay_type -- "daily" | "per_rai" | etc.
     FROM tasks t
     JOIN task_assignees ta
       ON ta.task_id = t.id
      AND ta.user_id = ${userId}::int
-    WHERE to_char(t.start_date, 'YYYY-MM') = ${month}::text
+    JOIN users u
+      ON u.id = ta.user_id
+    JOIN month_bounds mb ON TRUE
+    WHERE
+      t.start_date >= mb.d0 AND t.start_date < mb.d1
+      AND (t.end_date IS NULL OR (t.end_date >= mb.d0 AND t.end_date < mb.d1))
     ORDER BY t.start_date ASC, t.id ASC
   `;
 
-    // สรุปยอดรวม (ไร่/ซ่อม/รายวัน) จาก details
     let raiQty = 0;
     let raiAmount = 0;
     let repairDays = 0;
@@ -56,42 +74,75 @@ async function computeFromDb(db: any, userId: number, month: string) {
     let dailyAmount = 0;
 
     for (const r of details) {
+        const jobType: string = (r.job_type ?? "").trim();
+        const payType: string = (r.worker_pay_type ?? "").trim().toLowerCase();
+
         const area = r.area == null ? null : Number(r.area);
         const ratePerRai = r.rate_per_rai == null ? null : Number(r.rate_per_rai);
         const repairRate = r.repair_rate == null ? null : Number(r.repair_rate);
         const dailyRate = r.daily_rate == null ? null : Number(r.daily_rate);
 
-        if (area != null && ratePerRai != null) {
-            raiQty += area;
-            raiAmount += area * ratePerRai;
+        if (payType === "daily") {
+            if (dailyRate != null) dailyAmount += dailyRate;
+            continue;
         }
-        if (repairRate != null) {
-            repairDays += 1; // นับเป็น 1 วัน/1 งาน
-            repairAmount += repairRate;
-        }
-        if (dailyRate != null) {
-            dailyAmount += dailyRate;
+
+        if (jobType === "งานไร่") {
+            if (area != null && ratePerRai != null) {
+                raiQty += area;
+                raiAmount += area * ratePerRai;
+            }
+        } else if (jobType === "งานซ่อม") {
+            if (repairRate != null) {
+                repairDays += 1;
+                repairAmount += repairRate;
+            }
         }
     }
 
     const gross = raiAmount + repairAmount + dailyAmount;
 
-    // แปลง details เป็น array สำหรับ UI
     const lines = details.map((r: any) => {
         const ds = r.start_date?.toISOString?.()
             ? r.start_date.toISOString().slice(0, 10)
             : String(r.start_date);
-        const areaTxt = r.area != null ? `${Number(r.area)} ไร่` : "";
+
+        const ed = r.end_date?.toISOString?.()
+            ? r.end_date.toISOString().slice(0, 10)
+            : r.end_date ? String(r.end_date) : null;
+
+        // ทำความสะอาดตัวเลข (เช่น 2.00 -> 2)
+        const asNumber = (v: any) =>
+            v == null ? null : Number(v);
+
+        const areaNum = asNumber(r.area);
+
+        // ✅ รูปแบบ display ตามที่ต้องการ
+        // - งานไร่: มี "x ไร่"
+        // - งานซ่อม: ไม่มี "0 ไร่" ต่อท้าย
+        let display: string;
+        if ((r.job_type ?? "").trim() === "งานไร่") {
+            const areaTxt = areaNum != null ? `${areaNum} ไร่` : "";
+            display = `${ds} ${r.title}${areaTxt ? " " + areaTxt : ""}`;
+        } else if ((r.job_type ?? "").trim() === "งานซ่อม") {
+            display = `${ds} ${r.title}`;
+        } else {
+            // เผื่อประเภทอื่น ๆ ในอนาคต
+            display = `${ds} ${r.title}`;
+        }
+
         return {
             date: ds,
+            endDate: ed,
             taskId: r.task_id,
             title: r.title,
             jobType: r.job_type,
+            workerPayType: r.worker_pay_type,
             area: r.area,
             ratePerRai: r.rate_per_rai,
             repairRate: r.repair_rate,
             dailyRate: r.daily_rate,
-            display: `${ds} ${r.title}${areaTxt ? " " + areaTxt : ""}`,
+            display,
         };
     });
 
@@ -108,9 +159,7 @@ async function computeFromDb(db: any, userId: number, month: string) {
     };
 }
 
-/** ---------- GET /payrolls/preview?userId=&month=YYYY-MM ----------
- * ใช้ก่อนกดบันทึก เพื่อดึงรายละเอียดงาน + สรุปยอด
- */
+/** ---------- GET /payrolls/preview ---------- */
 router.get("/preview", auth, async (c) => {
     try {
         const db = getDb((c as any).env);
@@ -129,10 +178,7 @@ router.get("/preview", auth, async (c) => {
     }
 });
 
-/** ---------- POST /payrolls (บันทึกใบจริงลง payroll_slips) ----------
- * body: { userId, month, deduction, note? }
- * Boss/Admin เท่านั้น
- */
+/** ---------- POST /payrolls ---------- */
 router.post("/", auth, requireRole(["boss", "admin"]), async (c) => {
     try {
         const db = getDb((c as any).env);
@@ -144,23 +190,21 @@ router.post("/", auth, requireRole(["boss", "admin"]), async (c) => {
 
         const { userId, month, deduction, note } = parsed.data;
 
-        // กันซ้ำ: เดือนเดียวกัน คนเดียวกัน
         const dup = await db/*sql*/`
       SELECT 1 FROM payroll_slips
       WHERE user_id = ${userId}::int AND month = ${month}::text
       LIMIT 1
     `;
-        if (dup.length) return responseError(c, "duplicate_slip", 409, "already exists for this user and month");
+        if (dup.length) {
+            return responseError(c, "duplicate_slip", 409, "already exists for this user and month");
+        }
 
-        // คำนวณจากฐานข้อมูลจริง
         const summary = await computeFromDb(db, userId, month);
         const gross = summary.grossAmount;
         const net = Math.max(0, gross - deduction);
 
-        // ใช้ transaction สั้น ๆ
         await db/*sql*/`BEGIN`;
         try {
-            // ใส่ข้อมูล snapshot
             const ins = await db/*sql*/`
         INSERT INTO payroll_slips (
           user_id, month,
@@ -180,7 +224,6 @@ router.post("/", auth, requireRole(["boss", "admin"]), async (c) => {
       `;
             const slip = ins[0];
 
-            // gen slip_no ด้วย id เพื่อกัน race (เช่น PR-202509-000123)
             const upd = await db/*sql*/`
         UPDATE payroll_slips
         SET slip_no = 'PR-' || replace(${month}::text, '-', '') || '-' || lpad(${slip.id}::text, 6, '0')
@@ -199,13 +242,10 @@ router.post("/", auth, requireRole(["boss", "admin"]), async (c) => {
     }
 });
 
-/** ---------- GET /payrolls (ลิสต์ใบจ่าย) ----------
- * รองรับกรอง ?userId=&month=YYYY-MM&status=Paid|Unpaid (ทั้งหมด optional)
- */
+/** ---------- GET /payrolls ---------- */
 router.get("/", auth, async (c) => {
     try {
         const db = getDb((c as any).env);
-
         const q = c.req.query();
         const parsed = ListQuerySchema.safeParse(q);
         if (!parsed.success) return responseError(c, parsed.error.flatten(), 400);
@@ -236,7 +276,7 @@ router.get("/", auth, async (c) => {
     }
 });
 
-/** ---------- GET /payrolls/:id (ดูใบเดี่ยว) ---------- */
+/** ---------- GET /payrolls/:id ---------- */
 router.get("/:id", auth, async (c) => {
     try {
         const db = getDb((c as any).env);
@@ -259,9 +299,7 @@ router.get("/:id", auth, async (c) => {
     }
 });
 
-/** ---------- PATCH /payrolls/:id/pay (เปลี่ยนสถานะจ่าย) ----------
- * body: { paid: boolean }
- */
+/** ---------- PATCH /payrolls/:id/pay ---------- */
 router.patch("/:id/pay", auth, requireRole(["boss", "admin"]), async (c) => {
     try {
         const db = getDb((c as any).env);
@@ -271,12 +309,13 @@ router.patch("/:id/pay", auth, requireRole(["boss", "admin"]), async (c) => {
         const body = await c.req.json().catch(() => ({}));
         const paid = Boolean(body?.paid);
 
+        // ✅ ใช้ CASE WHEN เพื่อเลี่ยงการส่ง now() เป็นพารามิเตอร์
         const rows = await db/*sql*/`
       UPDATE payroll_slips
-      SET status = ${paid ? "Paid" : "Unpaid"}::text,
-          paid_at = ${paid ? db`now()` : null},
+      SET status     = ${paid ? "Paid" : "Unpaid"}::text,
+          paid_at    = CASE WHEN ${paid}::boolean THEN now() ELSE NULL END,
           updated_at = now()
-      WHERE id = ${id}
+      WHERE id = ${id}::int
       RETURNING *
     `;
         if (!rows.length) return responseError(c, "not_found", 404);
@@ -287,9 +326,7 @@ router.patch("/:id/pay", auth, requireRole(["boss", "admin"]), async (c) => {
     }
 });
 
-/** ---------- DELETE /payrolls/:id (ลบใบ) ----------
- * เผื่อกรณีบันทึกผิด
- */
+/** ---------- DELETE /payrolls/:id ---------- */
 router.delete("/:id", auth, requireRole(["boss", "admin"]), async (c) => {
     try {
         const db = getDb((c as any).env);
@@ -298,7 +335,7 @@ router.delete("/:id", auth, requireRole(["boss", "admin"]), async (c) => {
 
         const rows = await db/*sql*/`
       DELETE FROM payroll_slips
-      WHERE id = ${id}
+      WHERE id = ${id}::int
       RETURNING id
     `;
         if (!rows.length) return responseError(c, "not_found", 404);
