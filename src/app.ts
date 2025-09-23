@@ -1,5 +1,5 @@
 // src/index.ts
-import { Hono } from "hono";
+import { ExecutionContext, Hono } from "hono";
 import { cors } from "hono/cors";
 import { serveStatic } from "hono/cloudflare-workers";
 import debugRouter from "./routes/debug";
@@ -13,12 +13,8 @@ import reportSummaryRouter from "./routes/reports";
 import announcementsRouter from "./routes/announcements";
 import ruleRouter from "./routes/rule";
 import type { Bindings } from "./types";
-import cron from "node-cron";
-import { Pool } from "pg";
 
-const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-});
+import { getDb } from "./db";
 
 const app = new Hono<{ Bindings: Bindings }>();
 
@@ -64,47 +60,44 @@ app.use("/images/*", serveStatic({ root: "./" }));
 app.options("*", (c) => c.body(null, 204));
 
 /* ==========================================================
-   🕒 CRON JOB: ทุกวันเวลา 00:01 (โซนเวลาไทย)
+   🔔 Cloudflare Cron Trigger handler (แทน node-cron)
+   เวลา: ตั้งใน wrangler.toml เป็น "1 17 * * *" (17:01 UTC = 00:01 ไทย)
+   ใช้วันที่ไทยใน SQL: (now() AT TIME ZONE 'Asia/Bangkok')::date
    กติกา:
-   - วันนี้ > end_date  → status = Done, color = #2E7D32
-   - วันนี้ = start_date → status = InProgress, color = #2962FF
+   - วันนี้(ไทย) > end_date  → status = Done, color = #2E7D32
+   - วันนี้(ไทย) = start_date → status = InProgress, color = #2962FF
    ========================================================== */
-cron.schedule(
-    "1 0 * * *",
-    async () => {
-        const client = await pool.connect();
+async function runDailyStatusUpdate(env: Bindings) {
+    const db = getDb(env);
+
+    await db/*sql*/`
+    UPDATE tasks
+    SET status = 'Done',
+        color  = '#2E7D32'
+    WHERE end_date < (now() AT TIME ZONE 'Asia/Bangkok')::date
+      AND status <> 'Done'
+  `;
+
+    await db/*sql*/`
+    UPDATE tasks
+    SET status = 'InProgress',
+        color  = '#2962FF'
+    WHERE start_date = (now() AT TIME ZONE 'Asia/Bangkok')::date
+      AND status NOT IN ('InProgress','Done')
+  `;
+}
+
+export default {
+    fetch: (req: Request, env: Bindings, ctx: ExecutionContext) =>
+        app.fetch(req, env, ctx),
+    scheduled: async (_event: any, env: Bindings, _ctx: ExecutionContext) => {
         try {
-            await client.query("BEGIN");
-            await client.query(
-                `
-                    UPDATE tasks
-                    SET status = 'Done',
-                        color  = '#2E7D32'
-                    WHERE end_date < CURRENT_DATE
-                    AND status <> 'Done'
-                `
-            );
-            await client.query(
-                `
-                    UPDATE tasks
-                    SET status = 'InProgress',
-                        color  = '#2962FF'
-                    WHERE start_date = CURRENT_DATE
-                    AND status NOT IN ('InProgress', 'Done')
-                `
-            );
-            await client.query("COMMIT");
+            console.log("🔄 Running daily task status update (cron) ...");
+            await runDailyStatusUpdate(env);
+            console.log("✅ Daily task status update done.");
         } catch (err) {
-            await (async () => {
-                try {
-                    await pool.query("ROLLBACK");
-                } catch { }
-            })();
-        } finally {
-            client.release();
+            console.error("❌ Cron error:", err);
+            throw err;
         }
     },
-    { timezone: "Asia/Bangkok" }
-);
-
-export default app;
+};

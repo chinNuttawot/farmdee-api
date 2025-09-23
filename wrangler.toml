@@ -16,18 +16,22 @@ ENV = "dev"
 [env.dev]
 name = "farmdee-api-dev"
 workers_dev = true
+triggers = { crons = ["1 17 * * *"] }
 
 [env.dev.vars]
 ENV = "dev"
 CORS_ALLOW_ORIGIN = "*"
 PBKDF2_ITER = "100000"
+triggers = { crons = ["1 17 * * *"] }
 
 # ---------- PROD ----------
 [env.prod]
 name = "farmdee-api-prod"
 workers_dev = true
+triggers = { crons = ["1 17 * * *"] }
 
 [env.prod.vars]
 ENV = "prod"
 CORS_ALLOW_ORIGIN = "*"
 PBKDF2_ITER = "100000"
+triggers = { crons = ["1 17 * * *"] }
