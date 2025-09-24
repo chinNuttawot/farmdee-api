@@ -111,15 +111,9 @@ async function computeFromDb(db: any, userId: number, month: string) {
             ? r.end_date.toISOString().slice(0, 10)
             : r.end_date ? String(r.end_date) : null;
 
-        // ทำความสะอาดตัวเลข (เช่น 2.00 -> 2)
-        const asNumber = (v: any) =>
-            v == null ? null : Number(v);
-
+        const asNumber = (v: any) => (v == null ? null : Number(v));
         const areaNum = asNumber(r.area);
 
-        // ✅ รูปแบบ display ตามที่ต้องการ
-        // - งานไร่: มี "x ไร่"
-        // - งานซ่อม: ไม่มี "0 ไร่" ต่อท้าย
         let display: string;
         if ((r.job_type ?? "").trim() === "งานไร่") {
             const areaTxt = areaNum != null ? `${areaNum} ไร่` : "";
@@ -127,7 +121,6 @@ async function computeFromDb(db: any, userId: number, month: string) {
         } else if ((r.job_type ?? "").trim() === "งานซ่อม") {
             display = `${ds} ${r.title}`;
         } else {
-            // เผื่อประเภทอื่น ๆ ในอนาคต
             display = `${ds} ${r.title}`;
         }
 
@@ -255,7 +248,9 @@ router.get("/", auth, async (c) => {
         const status = parsed.data.status ?? null;
 
         const rows = await db/*sql*/`
-      SELECT p.*, u.username AS employee_username, c.username AS created_by_username
+      SELECT p.*,
+             u.full_name AS employee_username,  -- ใช้ full_name แต่คง alias เดิม
+             c.full_name AS created_by_username
       FROM payroll_slips p
       JOIN users u ON u.id = p.user_id
       JOIN users c ON c.id = p.created_by
@@ -284,7 +279,9 @@ router.get("/:id", auth, async (c) => {
         if (!Number.isInteger(id) || id <= 0) return responseError(c, "invalid id", 400);
 
         const rows = await db/*sql*/`
-      SELECT p.*, u.username AS employee_username, c.username AS created_by_username
+      SELECT p.*,
+             u.full_name AS employee_username,  -- ใช้ full_name แต่คง alias เดิม
+             c.full_name AS created_by_username
       FROM payroll_slips p
       JOIN users u ON u.id = p.user_id
       JOIN users c ON c.id = p.created_by
@@ -309,7 +306,7 @@ router.patch("/:id/pay", auth, requireRole(["boss", "admin"]), async (c) => {
         const body = await c.req.json().catch(() => ({}));
         const paid = Boolean(body?.paid);
 
-        // ✅ ใช้ CASE WHEN เพื่อเลี่ยงการส่ง now() เป็นพารามิเตอร์
+        // ใช้ CASE WHEN เพื่อเลี่ยงการส่ง now() เป็นพารามิเตอร์
         const rows = await db/*sql*/`
       UPDATE payroll_slips
       SET status     = ${paid ? "Paid" : "Unpaid"}::text,

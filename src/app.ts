@@ -13,7 +13,7 @@ import reportSummaryRouter from "./routes/reports";
 import announcementsRouter from "./routes/announcements";
 import ruleRouter from "./routes/rule";
 import type { Bindings } from "./types";
-
+import empAnnouncementsRouter from "./routes/emp-announcements";
 import { getDb } from "./db";
 
 const app = new Hono<{ Bindings: Bindings }>();
@@ -54,6 +54,7 @@ app.route("/payrolls", payrollsRouter);
 app.route("/reports", reportSummaryRouter);
 app.route("/announcements", announcementsRouter);
 app.route("/rule", ruleRouter);
+app.route("/emp-announcements", empAnnouncementsRouter);
 
 app.use("/images/*", serveStatic({ root: "./" }));
 
