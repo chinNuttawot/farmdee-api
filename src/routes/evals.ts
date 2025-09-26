@@ -350,5 +350,53 @@ router.post("/:id/submit", auth, async (c) => {
         return responseError(c, "failed", 400, err?.message ?? String(err));
     }
 });
+/** ========= DELETE /evals/:id ========= */
+router.delete("/:id", auth, async (c) => {
+    try {
+        const id = Number(c.req.param("id"));
+        if (!Number.isFinite(id) || id <= 0) {
+            return responseError(c, "invalid id", 400);
+        }
+
+        const db = getDb((c as any).env);
+
+        // ตรวจว่ามีอยู่จริง + เช็คสถานะ
+        const head = await db/*sql*/`
+      SELECT id, status
+      FROM evaluations
+      WHERE id = ${id}
+      LIMIT 1
+    `;
+        if (head.length === 0) return responseError(c, "not found", 404);
+
+        if (head[0].status !== "Draft") {
+            return responseError(c, "only Draft evaluation can be deleted", 409);
+        }
+
+        // ใช้ transaction แบบ manual
+        try {
+            await db`BEGIN`;
+
+            await db/*sql*/`
+        DELETE FROM evaluation_item_scores
+        WHERE evaluation_id = ${id}
+      `;
+
+            await db/*sql*/`
+        DELETE FROM evaluations
+        WHERE id = ${id}
+      `;
+
+            await db`COMMIT`;
+        } catch (err) {
+            await db`ROLLBACK`;
+            throw err;
+        }
+
+        return responseSuccess(c, "deleted", { id });
+    } catch (err: any) {
+        return responseError(c, "failed", 400, err?.message ?? String(err));
+    }
+});
 
 export default router;
