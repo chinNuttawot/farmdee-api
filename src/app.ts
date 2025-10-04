@@ -12,13 +12,13 @@ import payrollsRouter from "./routes/payrolls";
 import reportSummaryRouter from "./routes/reports";
 import announcementsRouter from "./routes/announcements";
 import ruleRouter from "./routes/rule";
-import type { Bindings } from "./types";
 import empAnnouncementsRouter from "./routes/emp-announcements";
 import evalsRouter from "./routes/evals";
-import { getDb } from "./db";
+import type { Bindings } from "./types";
 
 const app = new Hono<{ Bindings: Bindings }>();
 
+// ✅ Error handler
 app.onError((err, c) => {
     console.error("UNCAUGHT ERROR:", err);
     return c.json(
@@ -27,8 +27,10 @@ app.onError((err, c) => {
     );
 });
 
+// ✅ Not found
 app.notFound((c) => c.json({ error: "not_found" }, 404));
 
+// ✅ CORS
 app.use(
     "*",
     cors({
@@ -41,10 +43,10 @@ app.use(
     })
 );
 
-// ✅ healthcheck
+// ✅ Health check
 app.get("/health", (c) => c.text("ok"));
 
-// ✅ routes
+// ✅ Routes
 app.route("/", debugRouter);
 app.route("/auth", authRouter);
 app.route("/me", meRouter);
@@ -58,6 +60,14 @@ app.route("/rule", ruleRouter);
 app.route("/emp-announcements", empAnnouncementsRouter);
 app.route("/evals", evalsRouter);
 
+// ✅ Static files
 app.use("/images/*", serveStatic({ root: "./" }));
 
+// ✅ CORS preflight
 app.options("*", (c) => c.body(null, 204));
+
+// ✅ Default export for Cloudflare Worker
+export default {
+    fetch: (req: Request, env: Bindings, ctx: ExecutionContext) =>
+        app.fetch(req, env, ctx),
+};
