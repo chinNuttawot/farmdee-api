@@ -19,6 +19,17 @@ const DateString = z
 const IntLike = z.coerce.number().int();
 const NumLike = z.coerce.number();
 
+// ⬇️ เงินทศนิยม: ยอมรับ number หรือ string, >= 0 และไม่เกิน 2 ตำแหน่ง
+const Money2 = z.preprocess(
+    (v) => (v === "" || v === null ? undefined : v),
+    z.coerce
+        .number()
+        .nonnegative()
+        .refine((v) => Math.round(v * 100) === v * 100, {
+            message: "must have at most 2 decimal places",
+        })
+);
+
 // แปลง "" → undefined ก่อน validate
 const OptInt = z.preprocess(
     (v) => (v === "" || v === null ? undefined : v),
@@ -56,8 +67,9 @@ const CreateTaskBase = z
         area: OptNum.optional(),
         trucks: OptInt.optional(),
 
-        totalAmount: IntLike.nonnegative(),
-        paidAmount: IntLike.nonnegative().default(0),
+        // ⬇️ เปลี่ยนจาก IntLike -> Money2 เพื่อรองรับทศนิยม
+        totalAmount: Money2.default(0),
+        paidAmount: Money2.default(0),
 
         note: z.string().max(2000).optional(),
         status: StatusType.optional(),
@@ -97,7 +109,7 @@ export const CreateTaskSchema = CreateTaskBase.superRefine((data, ctx) => {
         });
     }
 
-    // งานไร่ ต้องกรอกอย่างน้อย 1: area หรือ trucks
+    // งานไร่: ต้องกรอกอย่างน้อย 1: area หรือ trucks
     if (data.jobType === "งานไร่") {
         if (data.area === undefined && data.trucks === undefined) {
             ctx.addIssue({
@@ -107,7 +119,6 @@ export const CreateTaskSchema = CreateTaskBase.superRefine((data, ctx) => {
             });
         }
     }
-    // งานซ่อม → ไม่บังคับ area/trucks (ปล่อยว่างได้)
 });
 
 /** ===== Update (PATCH) ===== */
@@ -142,7 +153,6 @@ export const UpdateTaskSchema = CreateTaskBase.partial()
             });
         }
 
-        // สำหรับ PATCH: บังคับก็ต่อเมื่อผู้ใช้ส่ง jobType=งานไร่ มาด้วย
         if (data.jobType === "งานไร่") {
             if (data.area === undefined && data.trucks === undefined) {
                 ctx.addIssue({
