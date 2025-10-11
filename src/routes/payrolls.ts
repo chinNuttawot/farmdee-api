@@ -26,16 +26,7 @@ const ListQuerySchema = z.object({
     status: z.enum(["Paid", "Unpaid"]).optional(),
 });
 
-/** ===== คำนวณจาก tasks + task_assignees (ไม่สร้างตารางใหม่) =====
- * กติกา:
- * 1) ถ้าพนักงานเป็น Daily → ใช้ daily_rate ของงานนั้น ๆ
- * 2) มิฉะนั้น ให้ดู jobType:
- *    - "งานไร่"  → ใช้ area * rate_per_rai
- *    - "งานซ่อม" → ใช้ repair_rate (คิดเป็นงานละ 1)
- * เงื่อนไขเลือกงาน:
- * - start_date ต้องอยู่ในเดือน
- * - end_date ถ้าไม่ NULL ต้องอยู่ในเดือนด้วย
- */
+/** ===== คำนวณจาก tasks + task_assignees (ไม่สร้างตารางใหม่) ===== */
 async function computeFromDb(db: any, userId: number, month: string) {
     const details = await db/*sql*/`
     WITH month_bounds AS (
@@ -152,6 +143,70 @@ async function computeFromDb(db: any, userId: number, month: string) {
     };
 }
 
+/** ---------- Helpers: expense ↔ slip ---------- */
+
+// คืนข้อมูลสลิป + ชื่อพนักงาน (ไว้ทำ title)
+async function getSlipWithUser(db: any, id: number) {
+    const rows = await db/*sql*/`
+    SELECT
+      p.*,
+      COALESCE(u.full_name, u.username) AS employee_name
+    FROM payroll_slips p
+    JOIN users u ON u.id = p.user_id
+    WHERE p.id = ${id}::int
+    LIMIT 1
+  `;
+    return rows[0] ?? null;
+}
+
+/**
+ * สร้าง/อัปเดต expense สำหรับสลิปที่จ่ายแล้ว (idempotent)
+ * - type: "labor"
+ * - amount: ใช้ net_amount ของสลิป
+ * - work_date: ใช้ paid_at::date ถ้ามี (สำรองเป็น now()::date)
+ * - title: "ค่าแรง <YYYY-MM> - <ชื่อพนักงาน> (<SLIP_NO>)"
+ */
+async function upsertExpenseForSlip(db: any, slipId: number, creatorUserId: number) {
+    const slip = await getSlipWithUser(db, slipId);
+    if (!slip) throw new Error("payroll_not_found");
+
+    const employee = slip.employee_name ?? "ไม่ระบุชื่อ";
+    const monthStr = slip.month ?? "-";
+    const amountNum = Number(slip.net_amount ?? 0);
+    const title = `ค่าแรง ${monthStr} - ${employee}${slip.slip_no ? ` (${slip.slip_no})` : ""}`;
+
+    // หากไม่อนุญาตจ่ายกรณี amount <= 0 ให้ยกเลิกตรงนี้ได้:
+    // if (!Number.isFinite(amountNum) || amountNum <= 0) {
+    //   throw new Error("invalid_net_amount");
+    // }
+
+    await db/*sql*/`
+    INSERT INTO expenses (
+      title, type, amount, job_note, qty_note, work_date, created_by, payroll_slip_id
+    )
+    VALUES (
+      ${title}::text, 'labor'::text, ${amountNum}::numeric,
+      NULL::text, NULL::text,
+      COALESCE(${slip.paid_at}::timestamp, now())::date,
+      ${creatorUserId}::int, ${slip.id}::int
+    )
+    ON CONFLICT (payroll_slip_id)
+    DO UPDATE SET
+      title      = EXCLUDED.title,
+      amount     = EXCLUDED.amount,
+      work_date  = EXCLUDED.work_date,
+      updated_at = now();
+  `;
+}
+
+/** ลบ expense ที่ผูกกับสลิปนี้ (สำหรับกรณีเปลี่ยนเป็น Unpaid) */
+async function deleteExpenseForSlip(db: any, slipId: number) {
+    await db/*sql*/`
+    DELETE FROM expenses
+    WHERE payroll_slip_id = ${slipId}::int
+  `;
+}
+
 /** ---------- GET /payrolls/preview ---------- */
 router.get("/preview", auth, async (c) => {
     try {
@@ -167,6 +222,7 @@ router.get("/preview", auth, async (c) => {
         const summary = await computeFromDb(db, parsed.data.userId, parsed.data.month);
         return responseSuccess(c, "payroll preview", summary);
     } catch (e: any) {
+        console.error("[GET /payrolls/preview] error:", e?.message, e?.stack);
         return responseError(c, "internal_error", 500, e?.message ?? String(e));
     }
 });
@@ -228,9 +284,11 @@ router.post("/", auth, requireRole(["boss", "admin"]), async (c) => {
             return responseSuccess(c, "payroll created", upd[0], 201);
         } catch (e) {
             await db/*sql*/`ROLLBACK`;
+            console.error("[POST /payrolls] tx error:", (e as any)?.message, (e as any)?.stack);
             return responseError(c, "create_failed", 500, (e as any)?.message ?? String(e));
         }
     } catch (e: any) {
+        console.error("[POST /payrolls] error:", e?.message, e?.stack);
         return responseError(c, "internal_error", 500, e?.message ?? String(e));
     }
 });
@@ -249,8 +307,8 @@ router.get("/", auth, async (c) => {
 
         const rows = await db/*sql*/`
       SELECT p.*,
-             u.full_name AS employee_username,  -- ใช้ full_name แต่คง alias เดิม
-             c.full_name AS created_by_username
+             COALESCE(u.full_name, u.username) AS employee_username,
+             COALESCE(c.full_name, c.username) AS created_by_username
       FROM payroll_slips p
       JOIN users u ON u.id = p.user_id
       JOIN users c ON c.id = p.created_by
@@ -267,6 +325,7 @@ router.get("/", auth, async (c) => {
             items: rows,
         });
     } catch (e: any) {
+        console.error("[GET /payrolls] error:", e?.message, e?.stack);
         return responseError(c, "internal_error", 500, e?.message ?? String(e));
     }
 });
@@ -280,8 +339,8 @@ router.get("/:id", auth, async (c) => {
 
         const rows = await db/*sql*/`
       SELECT p.*,
-             u.full_name AS employee_username,  -- ใช้ full_name แต่คง alias เดิม
-             c.full_name AS created_by_username
+             COALESCE(u.full_name, u.username) AS employee_username,
+             COALESCE(c.full_name, c.username) AS created_by_username
       FROM payroll_slips p
       JOIN users u ON u.id = p.user_id
       JOIN users c ON c.id = p.created_by
@@ -292,6 +351,7 @@ router.get("/:id", auth, async (c) => {
 
         return responseSuccess(c, "payroll", rows[0]);
     } catch (e: any) {
+        console.error("[GET /payrolls/:id] error:", e?.message, e?.stack);
         return responseError(c, "internal_error", 500, e?.message ?? String(e));
     }
 });
@@ -305,20 +365,40 @@ router.patch("/:id/pay", auth, requireRole(["boss", "admin"]), async (c) => {
 
         const body = await c.req.json().catch(() => ({}));
         const paid = Boolean(body?.paid);
+        const user = c.get("user") as { id: number };
 
-        // ใช้ CASE WHEN เพื่อเลี่ยงการส่ง now() เป็นพารามิเตอร์
-        const rows = await db/*sql*/`
-      UPDATE payroll_slips
-      SET status     = ${paid ? "Paid" : "Unpaid"}::text,
-          paid_at    = CASE WHEN ${paid}::boolean THEN now() ELSE NULL END,
-          updated_at = now()
-      WHERE id = ${id}::int
-      RETURNING *
-    `;
-        if (!rows.length) return responseError(c, "not_found", 404);
+        await db/*sql*/`BEGIN`;
+        try {
+            // อัปเดตสถานะสลิป + เวลาจ่าย
+            const rows = await db/*sql*/`
+        UPDATE payroll_slips
+        SET status     = ${paid ? "Paid" : "Unpaid"}::text,
+            paid_at    = CASE WHEN ${paid}::boolean THEN now() ELSE NULL END,
+            updated_at = now()
+        WHERE id = ${id}::int
+        RETURNING *
+      `;
+            if (!rows.length) {
+                await db/*sql*/`ROLLBACK`;
+                return responseError(c, "not_found", 404);
+            }
 
-        return responseSuccess(c, "payroll status updated", rows[0]);
+            // จัดการ expense ตามสถานะ
+            if (paid) {
+                await upsertExpenseForSlip(db, id, user.id);
+            } else {
+                await deleteExpenseForSlip(db, id);
+            }
+
+            await db/*sql*/`COMMIT`;
+            return responseSuccess(c, "payroll status updated", rows[0]);
+        } catch (e) {
+            await db/*sql*/`ROLLBACK`;
+            console.error("[PATCH /payrolls/:id/pay] tx error:", (e as any)?.message, (e as any)?.stack);
+            return responseError(c, "internal_error", 500, (e as any)?.message ?? String(e));
+        }
     } catch (e: any) {
+        console.error("[PATCH /payrolls/:id/pay] error:", e?.message, e?.stack);
         return responseError(c, "internal_error", 500, e?.message ?? String(e));
     }
 });
@@ -330,6 +410,7 @@ router.delete("/:id", auth, requireRole(["boss", "admin"]), async (c) => {
         const id = Number(c.req.param("id"));
         if (!Number.isInteger(id) || id <= 0) return responseError(c, "invalid id", 400);
 
+        // ไม่ต้องลบ expense เอง หากใช้ FK ON DELETE CASCADE
         const rows = await db/*sql*/`
       DELETE FROM payroll_slips
       WHERE id = ${id}::int
@@ -339,6 +420,7 @@ router.delete("/:id", auth, requireRole(["boss", "admin"]), async (c) => {
 
         return responseSuccess(c, "payroll deleted", { id: rows[0].id });
     } catch (e: any) {
+        console.error("[DELETE /payrolls/:id] error:", e?.message, e?.stack);
         return responseError(c, "internal_error", 500, e?.message ?? String(e));
     }
 });

@@ -19,7 +19,7 @@ const DateString = z
 const IntLike = z.coerce.number().int();
 const NumLike = z.coerce.number();
 
-// ⬇️ เงินทศนิยม: ยอมรับ number หรือ string, >= 0 และไม่เกิน 2 ตำแหน่ง
+// เงินทศนิยม: ยอมรับ number/string, >= 0 และทศนิยมไม่เกิน 2 ตำแหน่ง
 const Money2 = z.preprocess(
     (v) => (v === "" || v === null ? undefined : v),
     z.coerce
@@ -67,7 +67,7 @@ const CreateTaskBase = z
         area: OptNum.optional(),
         trucks: OptInt.optional(),
 
-        // ⬇️ เปลี่ยนจาก IntLike -> Money2 เพื่อรองรับทศนิยม
+        // รองรับทศนิยม
         totalAmount: Money2.default(0),
         paidAmount: Money2.default(0),
 

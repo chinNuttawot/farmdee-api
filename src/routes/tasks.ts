@@ -1,10 +1,10 @@
-// routes/tasks.ts
 import { Hono } from "hono";
 import { getDb } from "../db";
 import { auth } from "../middlewares/auth";
 import { requireRole, isBossOrAdmin } from "../middlewares/role";
 import { CreateTaskSchema, UpdateTaskSchema } from "../schemas/task";
 import { responseSuccess, responseError } from "../utils/responseHelper";
+
 // helpers
 function normalizeToStringArrayForGet(v: unknown): string[] {
   if (Array.isArray(v)) return v.map(String).map(s => s.trim()).filter(Boolean);
@@ -12,7 +12,6 @@ function normalizeToStringArrayForGet(v: unknown): string[] {
   return [];
 }
 function escapeLike(s: string) {
-  // หนี % และ _ รวมถึง \ ให้ปลอดภัยกับ LIKE
   return s.replace(/[\\%_]/g, "\\$&");
 }
 
@@ -21,17 +20,15 @@ const router = new Hono();
 /** ===== Status rules ===== */
 const ALLOWED_STATUS = new Set(["Pending", "InProgress", "Done"]);
 
-// ใช้กับ query filter (?status=Pending|InProgress|All)
 function normalizeStatusFilterToken(
   s: string
 ): "" | "Pending" | "InProgress" | "Done" {
   const v = (s ?? "").trim();
-  if (v === "" || v.toLowerCase() === "all") return ""; // All = ไม่กรอง
+  if (v === "" || v.toLowerCase() === "all") return "";
   if (ALLOWED_STATUS.has(v)) return v as any;
   throw new Error(`invalid status token: "${s}"`);
 }
 
-// ใช้กับ body (POST/PATCH)
 function normalizeStatusBody(val: unknown): "Pending" | "InProgress" | "Done" {
   const v = String(val ?? "").trim();
   if (ALLOWED_STATUS.has(v)) return v as any;
@@ -39,27 +36,18 @@ function normalizeStatusBody(val: unknown): "Pending" | "InProgress" | "Done" {
 }
 
 /** -------- helpers -------- */
-
-/** แปลงค่าที่มาจาก query ให้เป็น string[] เสมอ (รองรับ "a|b|c" หรือ array ของสตริง) */
 function normalizeToStringArray(v: unknown): string[] {
   if (Array.isArray(v)) {
     return v.map(String).map((s) => s.trim()).filter(Boolean);
   }
   if (typeof v === "string") {
-    return v
-      .split("|")
-      .map((s) => s.trim())
-      .filter(Boolean);
+    return v.split("|").map((s) => s.trim()).filter(Boolean);
   }
   return [];
 }
 
 /**
- * upsertAssignees:
- * - useDefault=true  -> ดึง default rates จาก users แล้วใส่ task_assignees (batch)
- * - useDefault=false -> ใช้เรทที่ส่งมา (ratePerRai/repairRate/dailyRate)
- * - รองรับทั้ง userId และ username (จะ resolve เป็น id ให้)
- * NOTE: ตาราง task_assignees ไม่มีคอลัมน์ pay_type
+ * upsertAssignees: ใส่หรือตั้งค่า assignees ให้ task
  */
 async function upsertAssignees(
   db: any,
@@ -75,7 +63,7 @@ async function upsertAssignees(
 ) {
   if (!Array.isArray(list) || list.length === 0) return;
 
-  // resolve usernames -> ids (ครั้งเดียว)
+  // resolve usernames -> ids
   const needNames = Array.from(
     new Set(list.filter((a) => !a.userId && a.username).map((a) => a.username as string))
   );
@@ -114,7 +102,6 @@ async function upsertAssignees(
     }
   }
 
-  // use_default = true -> INSERT ... SELECT from users (batch)
   if (defaults.length > 0) {
     await db/*sql*/`
       INSERT INTO task_assignees (
@@ -138,7 +125,6 @@ async function upsertAssignees(
     `;
   }
 
-  // use_default = false -> ใช้ค่า explicit (ไม่ยุ่ง pay_type)
   for (const a of explicits) {
     await db/*sql*/`
       INSERT INTO task_assignees (
@@ -159,7 +145,6 @@ async function upsertAssignees(
   }
 }
 
-/** คืน JSON ของ assignees ด้วย taskId (ใช้ตอนที่ไม่มีตาราง t ให้ join) */
 async function fetchAssigneesJson(db: any, taskId: number) {
   const rows = await db/*sql*/`
     SELECT
@@ -168,7 +153,7 @@ async function fetchAssigneesJson(db: any, taskId: number) {
           json_build_object(
             'id', v.user_id,
             'username', v.username,
-            'payType', v.pay_type,               -- มาจาก VIEW
+            'payType', v.pay_type,
             'useDefault', v.use_default,
             'ratePerRai', v.eff_rate_per_rai,
             'repairRate', v.eff_repair_rate,
@@ -184,22 +169,28 @@ async function fetchAssigneesJson(db: any, taskId: number) {
   return rows[0]?.assignees ?? [];
 }
 
-/** -------- GET /tasks -------- */
+/** -------- GET /tasks --------
+ * เพิ่ม query param: userId (optional)
+ * - ถ้าระบุ userId: คืนเฉพาะ tasks ที่มีผู้ใช้นั้นถูก assign (อ้างอิง task_assignees)
+ * - ถ้าไม่ระบุ: คืนทุกงาน (ตาม filter อื่นๆ)
+ */
 router.get("/", auth, async (c) => {
   try {
     const db = getDb((c as any).env);
     const q = c.req.query();
 
-    // ----- รับพารามิเตอร์ -----
-    const fromParam = q.from ?? null; // YYYY-MM-DD -> t.start_date = from
-    const toParam = q.to ?? null;     // YYYY-MM-DD -> t.end_date = to
+    const fromParam = q.from ?? null;
+    const toParam = q.to ?? null;
 
+    // userId filter (optional)
+    const userIdRaw = q.userId ?? null;
+    const userIdNum = userIdRaw != null ? Number(userIdRaw) : null;
+    const hasUserId = Number.isInteger(userIdNum as number) && (userIdNum as number) > 0;
 
     const titleArr = normalizeToStringArrayForGet(q.title);
     const titlePatterns = titleArr.map(s => `%${escapeLike(s)}%`);
     const hasTitlePatterns = titlePatterns.length > 0;
 
-    // รองรับหลายสถานะ: ?status=Pending|InProgress|Done  และ All/ว่าง = ไม่กรอง
     let statusArr: string[] = [];
     let hasStatus = false;
     try {
@@ -207,7 +198,7 @@ router.get("/", auth, async (c) => {
       const tokens = raw.split("|").map((s) => s.trim()).filter(Boolean);
       const normalized = tokens
         .map((t) => normalizeStatusFilterToken(t))
-        .filter((t) => t !== ""); // ตัด All ออก
+        .filter((t) => t !== "");
       statusArr = normalized;
       hasStatus = statusArr.length > 0;
     } catch (e) {
@@ -215,47 +206,55 @@ router.get("/", auth, async (c) => {
     }
 
     const rows = await db/*sql*/`
-        SELECT
-          t.id,
-          TRIM(TRAILING '.' FROM TRIM(TRAILING '0' FROM t.area::text))::numeric AS area,
-          t.title,
-          t.job_type,
-          t.start_date,
-          t.end_date,
-          t.trucks,
-          t.total_amount,
-          t.paid_amount,
-          t.note,
-          t.status,
-          t.color,
-          t.tags,
-          t.progress,
-          t.created_by,
-          t.created_at,
-          COALESCE(a.assignees, '[]'::json) AS assignees
-        FROM tasks t
-        LEFT JOIN LATERAL (
-          SELECT json_agg(
-            json_build_object(
-              'id', v.user_id,
-              'username', v.username,
-              'payType', v.pay_type,
-              'useDefault', v.use_default,
-              'ratePerRai', v.eff_rate_per_rai,
-              'repairRate', v.eff_repair_rate,
-              'dailyRate', v.eff_daily_rate
-            ) ORDER BY v.username
-          ) AS assignees
-          FROM v_task_assignees_effective v
-          WHERE v.task_id = t.id
-        ) a ON TRUE
-        WHERE
-          ( ${fromParam}::date   IS NULL OR t.start_date = ${fromParam}::date )
-          AND ( ${toParam}::date IS NULL OR t.end_date   = ${toParam}::date )
-          AND ( ${hasStatus}::boolean IS FALSE OR t.status = ANY(${statusArr}::text[]) )
-          AND ( ${hasTitlePatterns}::boolean IS FALSE OR t.title ILIKE ANY(${titlePatterns}::text[]) )
-        ORDER BY t.created_at DESC, t.id DESC
-      `;
+      SELECT
+        t.id,
+        TRIM(TRAILING '.' FROM TRIM(TRAILING '0' FROM t.area::text))::numeric AS area,
+        t.title,
+        t.job_type,
+        t.start_date,
+        t.end_date,
+        t.trucks,
+        t.total_amount,
+        t.paid_amount,
+        t.note,
+        t.status,
+        t.color,
+        t.tags,
+        t.progress,
+        t.created_by,
+        t.created_at,
+        COALESCE(a.assignees, '[]'::json) AS assignees
+      FROM tasks t
+      LEFT JOIN LATERAL (
+        SELECT json_agg(
+          json_build_object(
+            'id', v.user_id,
+            'username', v.username,
+            'payType', v.pay_type,
+            'useDefault', v.use_default,
+            'ratePerRai', v.eff_rate_per_rai,
+            'repairRate', v.eff_repair_rate,
+            'dailyRate', v.eff_daily_rate
+          ) ORDER BY v.username
+        ) AS assignees
+        FROM v_task_assignees_effective v
+        WHERE v.task_id = t.id
+      ) a ON TRUE
+      WHERE
+        ( ${fromParam}::date   IS NULL OR t.start_date = ${fromParam}::date )
+        AND ( ${toParam}::date IS NULL OR t.end_date   = ${toParam}::date )
+        AND ( ${hasStatus}::boolean IS FALSE OR t.status = ANY(${statusArr}::text[]) )
+        AND ( ${hasTitlePatterns}::boolean IS FALSE OR t.title ILIKE ANY(${titlePatterns}::text[]) )
+        AND (
+          ${hasUserId}::boolean IS FALSE
+          OR EXISTS (
+              SELECT 1
+              FROM task_assignees ta
+              WHERE ta.task_id = t.id AND ta.user_id = ${userIdNum}::int
+          )
+        )
+      ORDER BY t.created_at DESC, t.id DESC
+    `;
 
     return responseSuccess(c, "tasks", {
       filters: {
@@ -263,6 +262,7 @@ router.get("/", auth, async (c) => {
         to: toParam ?? null,
         status: hasStatus ? statusArr : [],
         title: hasTitlePatterns ? titleArr : [],
+        userId: hasUserId ? userIdNum : null,
       },
       count: rows.length,
       items: rows,
@@ -329,7 +329,6 @@ router.post("/", auth, requireRole(["boss", "admin"]), async (c) => {
     if (!parsed.success) return responseError(c, parsed.error.flatten(), 400);
     const d: any = parsed.data;
 
-    // status default/validate
     let bodyStatus = "Pending";
     try {
       bodyStatus = d.status == null ? "Pending" : normalizeStatusBody(d.status);
@@ -337,7 +336,6 @@ router.post("/", auth, requireRole(["boss", "admin"]), async (c) => {
       return responseError(c, "invalid_status", 400, (e as Error).message);
     }
 
-    // insert task
     const trow = await db<{ id: number }>`
       INSERT INTO tasks (
         title, job_type, start_date, end_date, area, trucks,
@@ -349,8 +347,8 @@ router.post("/", auth, requireRole(["boss", "admin"]), async (c) => {
         ${d.endDate}::date,
         ${d.area ?? null}::numeric,
         ${d.trucks ?? null}::int,
-        ${d.totalAmount ?? 0}::numeric,
-        ${d.paidAmount ?? 0}::numeric,
+        ${d.totalAmount ?? 0}::numeric(12,2),
+        ${d.paidAmount ?? 0}::numeric(12,2),
         ${d.note ?? null}::text,
         ${bodyStatus}::text,
         ${d.color ?? null}::text,
@@ -366,7 +364,6 @@ router.post("/", auth, requireRole(["boss", "admin"]), async (c) => {
     if (Array.isArray(d.assigneeConfigs) && d.assigneeConfigs.length > 0) {
       await upsertAssignees(db, taskId, d.assigneeConfigs);
     } else if (Array.isArray(d.assigneeIds) && d.assigneeIds.length > 0) {
-      // ใช้ defaults จาก users (batch) — ไม่มี pay_type
       await db/*sql*/`
         INSERT INTO task_assignees (
           task_id, user_id, use_default, rate_per_rai, repair_rate, daily_rate
@@ -388,7 +385,6 @@ router.post("/", auth, requireRole(["boss", "admin"]), async (c) => {
           daily_rate   = EXCLUDED.daily_rate
       `;
     } else if (Array.isArray(d.assigneeUsernames) && d.assigneeUsernames.length > 0) {
-      // ใช้ defaults จาก users (batch) ด้วย usernames — ไม่มี pay_type
       await db/*sql*/`
         INSERT INTO task_assignees (
           task_id, user_id, use_default, rate_per_rai, repair_rate, daily_rate
@@ -478,7 +474,6 @@ router.patch("/:id", auth, async (c) => {
     const areaVal = d.area ?? null;
     const trucksVal = d.trucks ?? null;
 
-    // status (optional) — validate ถ้าส่งมา
     let statusVal: string | null = null;
     try {
       statusVal = d.status == null ? null : normalizeStatusBody(d.status);
@@ -492,7 +487,6 @@ router.patch("/:id", auth, async (c) => {
     const progressVal = d.progress ?? null;
     const noteVal = d.note ?? undefined;
 
-    // ⭐️ เพิ่มสองฟิลด์นี้
     const totalAmountVal = d.totalAmount ?? null;
     const paidAmountVal = d.paidAmount ?? null;
 
@@ -507,8 +501,8 @@ router.patch("/:id", auth, async (c) => {
         status        = COALESCE(${statusVal}::text,           status),
         color         = COALESCE(${colorVal}::text,            color),
         tags          = COALESCE(${tagsVal}::text[],           tags),
-        total_amount  = COALESCE(${totalAmountVal}::numeric,   total_amount),
-        paid_amount   = COALESCE(${paidAmountVal}::numeric,    paid_amount),
+        total_amount  = COALESCE(${totalAmountVal}::numeric(12,2),   total_amount),
+        paid_amount   = COALESCE(${paidAmountVal}::numeric(12,2),    paid_amount),
         progress      = CASE
                           WHEN (${progressVal}::numeric(3,1)) IS NULL THEN progress
                           ELSE GREATEST(0.0::numeric(3,1),
@@ -520,14 +514,12 @@ router.patch("/:id", auth, async (c) => {
     `;
     if (!updated.length) return responseError(c, "not_found", 404);
 
-    // ----- อัปเดตผู้รับงาน -----
     if (Array.isArray(d.assigneeConfigs)) {
       await db`DELETE FROM task_assignees WHERE task_id = ${id}`;
       await upsertAssignees(db, id, d.assigneeConfigs);
     } else if (Array.isArray(d.assigneeIds) || Array.isArray(d.assigneeUsernames)) {
       await db`DELETE FROM task_assignees WHERE task_id = ${id}`;
       if (Array.isArray(d.assigneeIds) && d.assigneeIds.length > 0) {
-        // defaults จาก users (batch) — ไม่มี pay_type
         await db/*sql*/`
           INSERT INTO task_assignees (
             task_id, user_id, use_default, rate_per_rai, repair_rate, daily_rate
@@ -549,7 +541,6 @@ router.patch("/:id", auth, async (c) => {
             daily_rate   = EXCLUDED.daily_rate
         `;
       } else if (Array.isArray(d.assigneeUsernames) && d.assigneeUsernames.length > 0) {
-        // defaults จาก users (batch) ด้วย usernames — ไม่มี pay_type
         await db/*sql*/`
           INSERT INTO task_assignees (
             task_id, user_id, use_default, rate_per_rai, repair_rate, daily_rate
@@ -590,6 +581,7 @@ router.post("/:id/payments", auth, requireRole(["boss", "admin"]), async (c) => 
     const amount = Number(body?.amount || 0);
     const note = body?.note ?? null;
 
+    // payments ยังเก็บเป็นจำนวนเต็ม (บาท) ตามที่ออกแบบ
     if (!Number.isInteger(amount) || amount <= 0) {
       return responseError(c, "amount invalid", 400);
     }
