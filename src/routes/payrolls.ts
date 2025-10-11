@@ -60,9 +60,12 @@ async function computeFromDb(db: any, userId: number, month: string) {
 
     let raiQty = 0;
     let raiAmount = 0;
-    let repairDays = 0;
+    let repairDays: number = 0;
     let repairAmount = 0;
     let dailyAmount = 0;
+
+    // กันนับรายวันซ้ำในวันเดียวกัน
+    const dailyDays = new Set<string>();
 
     for (const r of details) {
         const jobType: string = (r.job_type ?? "").trim();
@@ -73,11 +76,31 @@ async function computeFromDb(db: any, userId: number, month: string) {
         const repairRate = r.repair_rate == null ? null : Number(r.repair_rate);
         const dailyRate = r.daily_rate == null ? null : Number(r.daily_rate);
 
+        const ds =
+            r.start_date
+                ? (r.start_date.toISOString?.() ?? String(r.start_date)).slice(0, 10)
+                : null;
+
+        // ----- pay_type = daily -----
+        // ต้อง "แสดงจำนวน" งานไร่/ซ่อม แต่ "ไม่คิดเงิน" ของสองหมวดนี้
         if (payType === "daily") {
-            if (dailyRate != null) dailyAmount += dailyRate;
+            // นับรายวันต่อวันที่ไม่ซ้ำ
+            if (ds && !dailyDays.has(ds)) {
+                dailyDays.add(ds);
+                if (dailyRate != null) dailyAmount += dailyRate;
+            }
+            // แสดง count ของงานไร่/ซ่อม ในสรุป (แม้จะไม่คิดเงิน)
+            if (jobType === "งานไร่" && area != null) {
+                raiQty += area;            // ✅ นับจำนวนไร่เพื่อให้ UI เห็น
+                // ไม่บวก raiAmount
+            } else if (jobType === "งานซ่อม") {
+                repairDays += 1;           // ✅ นับจำนวนวันซ่อมเพื่อให้ UI เห็น
+                // ไม่บวก repairAmount
+            }
             continue;
         }
 
+        // ----- pay_type อื่น ๆ -----
         if (jobType === "งานไร่") {
             if (area != null && ratePerRai != null) {
                 raiQty += area;
@@ -109,8 +132,6 @@ async function computeFromDb(db: any, userId: number, month: string) {
         if ((r.job_type ?? "").trim() === "งานไร่") {
             const areaTxt = areaNum != null ? `${areaNum} ไร่` : "";
             display = `${ds} ${r.title}${areaTxt ? " " + areaTxt : ""}`;
-        } else if ((r.job_type ?? "").trim() === "งานซ่อม") {
-            display = `${ds} ${r.title}`;
         } else {
             display = `${ds} ${r.title}`;
         }
@@ -134,9 +155,9 @@ async function computeFromDb(db: any, userId: number, month: string) {
         userId,
         month,
         raiQty: Number(raiQty.toFixed(2)),
-        raiAmount: Number(raiAmount.toFixed(2)),
-        repairDays,
-        repairAmount: Number(repairAmount.toFixed(2)),
+        raiAmount: Number(raiAmount.toFixed(2)),      // 0 สำหรับ daily
+        repairDays,                                   // นับแม้เป็น daily
+        repairAmount: Number(repairAmount.toFixed(2)),// 0 สำหรับ daily
         dailyAmount: Number(dailyAmount.toFixed(2)),
         grossAmount: Number(gross.toFixed(2)),
         details: lines,
@@ -144,8 +165,6 @@ async function computeFromDb(db: any, userId: number, month: string) {
 }
 
 /** ---------- Helpers: expense ↔ slip ---------- */
-
-// คืนข้อมูลสลิป + ชื่อพนักงาน (ไว้ทำ title)
 async function getSlipWithUser(db: any, id: number) {
     const rows = await db/*sql*/`
     SELECT
@@ -175,11 +194,6 @@ async function upsertExpenseForSlip(db: any, slipId: number, creatorUserId: numb
     const amountNum = Number(slip.net_amount ?? 0);
     const title = `ค่าแรง ${monthStr} - ${employee}${slip.slip_no ? ` (${slip.slip_no})` : ""}`;
 
-    // หากไม่อนุญาตจ่ายกรณี amount <= 0 ให้ยกเลิกตรงนี้ได้:
-    // if (!Number.isFinite(amountNum) || amountNum <= 0) {
-    //   throw new Error("invalid_net_amount");
-    // }
-
     await db/*sql*/`
     INSERT INTO expenses (
       title, type, amount, job_note, qty_note, work_date, created_by, payroll_slip_id
@@ -199,7 +213,6 @@ async function upsertExpenseForSlip(db: any, slipId: number, creatorUserId: numb
   `;
 }
 
-/** ลบ expense ที่ผูกกับสลิปนี้ (สำหรับกรณีเปลี่ยนเป็น Unpaid) */
 async function deleteExpenseForSlip(db: any, slipId: number) {
     await db/*sql*/`
     DELETE FROM expenses
@@ -293,7 +306,7 @@ router.post("/", auth, requireRole(["boss", "admin"]), async (c) => {
     }
 });
 
-/** ---------- GET /payrolls ---------- */
+/** ---------- GET /payrolls (list) ---------- */
 router.get("/", auth, async (c) => {
     try {
         const db = getDb((c as any).env);
@@ -306,9 +319,11 @@ router.get("/", auth, async (c) => {
         const status = parsed.data.status ?? null;
 
         const rows = await db/*sql*/`
-      SELECT p.*,
-             COALESCE(u.full_name, u.username) AS employee_username,
-             COALESCE(c.full_name, c.username) AS created_by_username
+      SELECT 
+        p.*,
+        u.pay_type AS employee_pay_type,
+        COALESCE(u.full_name, u.username) AS employee_username,
+        COALESCE(c.full_name, c.username) AS created_by_username
       FROM payroll_slips p
       JOIN users u ON u.id = p.user_id
       JOIN users c ON c.id = p.created_by
@@ -338,9 +353,11 @@ router.get("/:id", auth, async (c) => {
         if (!Number.isInteger(id) || id <= 0) return responseError(c, "invalid id", 400);
 
         const rows = await db/*sql*/`
-      SELECT p.*,
-             COALESCE(u.full_name, u.username) AS employee_username,
-             COALESCE(c.full_name, c.username) AS created_by_username
+      SELECT 
+        p.*,
+        u.pay_type AS employee_pay_type,
+        COALESCE(u.full_name, u.username) AS employee_username,
+        COALESCE(c.full_name, c.username) AS created_by_username
       FROM payroll_slips p
       JOIN users u ON u.id = p.user_id
       JOIN users c ON c.id = p.created_by
@@ -369,7 +386,6 @@ router.patch("/:id/pay", auth, requireRole(["boss", "admin"]), async (c) => {
 
         await db/*sql*/`BEGIN`;
         try {
-            // อัปเดตสถานะสลิป + เวลาจ่าย
             const rows = await db/*sql*/`
         UPDATE payroll_slips
         SET status     = ${paid ? "Paid" : "Unpaid"}::text,
@@ -383,7 +399,6 @@ router.patch("/:id/pay", auth, requireRole(["boss", "admin"]), async (c) => {
                 return responseError(c, "not_found", 404);
             }
 
-            // จัดการ expense ตามสถานะ
             if (paid) {
                 await upsertExpenseForSlip(db, id, user.id);
             } else {
@@ -410,7 +425,6 @@ router.delete("/:id", auth, requireRole(["boss", "admin"]), async (c) => {
         const id = Number(c.req.param("id"));
         if (!Number.isInteger(id) || id <= 0) return responseError(c, "invalid id", 400);
 
-        // ไม่ต้องลบ expense เอง หากใช้ FK ON DELETE CASCADE
         const rows = await db/*sql*/`
       DELETE FROM payroll_slips
       WHERE id = ${id}::int
