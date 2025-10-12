@@ -698,4 +698,59 @@ router.delete("/:id", auth, requireRole(["boss", "admin"]), async (c) => {
   }
 });
 
+/** -------- PATCH /tasks/:id/status (boss/admin) -------- */
+router.patch("/:id/status", auth, requireRole(["boss", "admin"]), async (c) => {
+  try {
+    const db = getDb((c as any).env);
+    const id = Number(c.req.param("id"));
+    if (!Number.isInteger(id) || id <= 0) {
+      return responseError(c, "invalid id", 400);
+    }
+
+    // อ่าน body
+    let body: any = {};
+    try {
+      body = await c.req.json();
+    } catch {
+      return responseError(c, "Invalid JSON", 400);
+    }
+
+    // ตรวจสถานะ
+    let newStatus: "Pending" | "InProgress" | "Done";
+    try {
+      newStatus = normalizeStatusBody(body?.status);
+    } catch (e) {
+      return responseError(c, "invalid_status", 400, (e as Error).message);
+    }
+
+    // สี (เลือกใส่ก็ได้)
+    const colorVal = body?.color ?? null;
+
+    // กำหนด progress เริ่มต้นตามสถานะใหม่ (ถ้า caller ไม่ส่ง progress มา)
+    const STATUS_PROGRESS_DEFAULT: Record<"Pending" | "InProgress" | "Done", number> = {
+      Pending: 0.0,
+      InProgress: 0.5,
+      Done: 1.0,
+    };
+
+    // อัปเดต
+    const rows = await db/*sql*/`
+      UPDATE tasks SET
+        status   = ${newStatus}::text,
+        color    = COALESCE(${colorVal}::text, color),
+        progress = ${STATUS_PROGRESS_DEFAULT[newStatus]}::numeric(3,1)
+      WHERE id = ${id}
+      RETURNING *
+    `;
+    if (!rows.length) return responseError(c, "not_found", 404);
+
+    const assignees = await fetchAssigneesJson(db, id);
+    return responseSuccess(c, "status_updated", { task: { ...rows[0], assignees } });
+  } catch (e: any) {
+    console.error('PATCH /tasks/:id/status ERROR:', e);
+    return responseError(c, "internal", 500, e?.message ?? String(e));
+  }
+});
+
+
 export default router;
