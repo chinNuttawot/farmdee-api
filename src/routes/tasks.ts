@@ -273,6 +273,168 @@ router.get("/", auth, async (c) => {
   }
 });
 
+/** -------- GET /tasks/days --------
+ * คืน "รายการวัน" ในช่วง [from..to] ที่มีงาน (อย่างน้อย 1 งาน)
+ * Query:
+ *  - from, to: YYYY-MM-DD (จำเป็น) — แนะนำตั้งเป็น first/last day ของเดือนนั้น
+ *  - status: "Pending|InProgress|Done" (optional)
+ *  - title:  "คำ1|คำ2" ค้นหาใน title แบบ ILIKE (optional)
+ *  - userId: เฉพาะงานที่ assign ให้ userId นี้ (optional)
+ *  - detail: "true" จะคืน count/area_sum/amount_sum ต่อวัน (optional)
+ *
+ * ถ้าไม่ใส่ detail => ตอบเป็น { days: [ '2025-10-01', '2025-10-03', ... ] }
+ * ถ้า detail=true   => ตอบเป็น items พร้อม total/area_sum/amount_sum/by_status ต่อวัน
+ */
+router.get("/days", auth, async (c) => {
+  try {
+    const db = getDb((c as any).env);
+    const q = c.req.query();
+    console.log("[GET /tasks/days] q =>", q);
+
+    // ---------- helpers ----------
+    const isYMD = (s: string) => /^\d{4}-\d{2}-\d{2}$/.test(String(s ?? ""));
+    const parseBool = (v: unknown) => {
+      const s = String(v ?? "").trim().toLowerCase();
+      return s === "1" || s === "true" || s === "yes";
+    };
+    // คืนจำนวนเต็มบวก หรือ 0 เสมอ (กัน NaN/"NaN"/ค่าว่าง/ทศนิยม/ตัวอักษร)
+    const toSafePositiveIntOrZero = (v: unknown): number => {
+      const s = String(v ?? "").trim();
+      if (!s) return 0;
+      if (!/^\d+$/.test(s)) return 0;
+      const n = Number(s);
+      return Number.isSafeInteger(n) && n > 0 ? n : 0;
+    };
+    const titleArr = normalizeToStringArrayForGet(q.title);
+    const titlePatterns = titleArr.map((s) => `%${escapeLike(s)}%`);
+    const hasTitle = titlePatterns.length > 0;
+
+    // ---------- dates ----------
+    const from = String(q.from ?? "").trim();
+    const to = String(q.to ?? "").trim();
+    if (!from || !to || !isYMD(from) || !isYMD(to)) {
+      return responseError(
+        c,
+        "invalid_range",
+        400,
+        "query `from` และ `to` ต้องเป็นรูปแบบ YYYY-MM-DD"
+      );
+    }
+
+    // ---------- status ----------
+    let statusArr: string[] = [];
+    let hasStatus = false;
+    try {
+      const raw = String(q.status ?? "");
+      const tokens = raw.split("|").map((s) => s.trim()).filter(Boolean);
+      const normalized = tokens
+        .map((t) => normalizeStatusFilterToken(t))
+        .filter((t) => t !== "");
+      statusArr = normalized;
+      hasStatus = statusArr.length > 0;
+    } catch (e) {
+      return responseError(c, "invalid_status", 400, (e as Error).message);
+    }
+
+    // ---------- userId (assign filter) ----------
+    // ถ้าไม่ส่ง จะเป็น 0 => ปิดเงื่อนไข EXISTS
+    const userIdNum = toSafePositiveIntOrZero(q.userId);
+    const hasUserId = userIdNum > 0;
+
+    // ---------- detail flag ----------
+    const detail = parseBool(q.detail);
+
+    if (!detail) {
+      // ===== โหมดเบา: เอาเฉพาะ "วัน" ที่มีงาน =====
+      // ใช้ DISTINCT start_date::date + เงื่อนไขกรอง
+      const rows = await db/*sql*/`
+        SELECT DISTINCT t.start_date::date AS day
+        FROM public.tasks t
+        WHERE t.start_date::date BETWEEN ${from}::date AND ${to}::date
+          AND ( ${hasStatus}::boolean IS FALSE OR t.status = ANY(${statusArr}::text[]) )
+          AND ( ${hasTitle}::boolean  IS FALSE OR t.title ILIKE ANY(${titlePatterns}::text[]) )
+          AND (
+            ${hasUserId}::boolean IS FALSE
+            OR EXISTS (
+                SELECT 1
+                FROM public.task_assignees ta
+                WHERE ta.task_id = t.id AND ta.user_id = ${userIdNum}
+            )
+          )
+        ORDER BY 1
+      `;
+      // แปลงเป็น array ของ 'YYYY-MM-DD'
+      const days = rows.map((r: any) => r.day);
+
+      return responseSuccess(c, "days", {
+        filters: {
+          from, to,
+          status: hasStatus ? statusArr : [],
+          title: hasTitle ? titleArr : [],
+          userId: hasUserId ? userIdNum : null,
+          detail: false,
+        },
+        count: days.length,
+        days,
+      });
+    }
+
+    // ===== โหมดละเอียด: รายวัน + count/area_sum/amount_sum/by_status =====
+    // TIP: กัน NaN ของ float (ถ้าเคยมีใน DB เดิม) ด้วย CASE WHEN ... 'NaN'::float8
+    const rows = await db/*sql*/`
+      WITH base AS (
+        SELECT
+          t.start_date::date AS day,
+          t.status,
+          COUNT(*)::int AS cnt,
+          COALESCE(SUM(
+            CASE WHEN (t.area::float8 = 'NaN'::float8) THEN NULL ELSE t.area::float8 END
+          ), 0)::numeric AS area_sum,
+          COALESCE(SUM(
+            CASE WHEN (t.total_amount::float8 = 'NaN'::float8) THEN NULL ELSE t.total_amount::float8 END
+          ), 0)::numeric(12,2) AS amount_sum
+        FROM public.tasks t
+        WHERE t.start_date::date BETWEEN ${from}::date AND ${to}::date
+          AND ( ${hasStatus}::boolean IS FALSE OR t.status = ANY(${statusArr}::text[]) )
+          AND ( ${hasTitle}::boolean  IS FALSE OR t.title ILIKE ANY(${titlePatterns}::text[]) )
+          AND (
+            ${hasUserId}::boolean IS FALSE
+            OR EXISTS (
+                SELECT 1
+                FROM public.task_assignees ta
+                WHERE ta.task_id = t.id AND ta.user_id = ${userIdNum}
+            )
+          )
+        GROUP BY 1,2
+      )
+      SELECT
+        day,
+        SUM(cnt)::int                                        AS total,
+        COALESCE(SUM(area_sum), 0)::numeric                  AS area_sum,
+        COALESCE(SUM(amount_sum), 0)::numeric(12,2)          AS amount_sum,
+        jsonb_object_agg(status, cnt ORDER BY status)::jsonb AS by_status
+      FROM base
+      GROUP BY day
+      ORDER BY day
+    `;
+
+    return responseSuccess(c, "days", {
+      filters: {
+        from, to,
+        status: hasStatus ? statusArr : [],
+        title: hasTitle ? titleArr : [],
+        userId: hasUserId ? userIdNum : null,
+        detail: true,
+      },
+      count: rows.length,
+      items: rows,
+    });
+  } catch (e: any) {
+    console.error("GET /tasks/days ERROR:", e);
+    return responseError(c, "internal", 500, e?.message ?? String(e));
+  }
+});
+
 /** -------- GET /tasks/:id -------- */
 router.get("/:id", auth, async (c) => {
   try {
